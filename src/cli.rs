@@ -264,6 +264,7 @@ impl PackageManager {
 #[value(rename_all = "lower")]
 pub enum MakeTarget {
     Deb,
+    Rpm,
     Zip,
 }
 
@@ -271,6 +272,7 @@ impl MakeTarget {
     pub fn as_str(self) -> &'static str {
         match self {
             MakeTarget::Deb => "deb",
+            MakeTarget::Rpm => "rpm",
             MakeTarget::Zip => "zip",
         }
     }

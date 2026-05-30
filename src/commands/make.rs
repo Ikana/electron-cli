@@ -8,6 +8,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
 use flate2::{write::GzEncoder, Compression};
+use rpm::{BuildConfig, CompressionType, FileOptions, PackageBuilder};
 use serde::Serialize;
 use tar::{Builder as TarBuilder, Header as TarHeader};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
@@ -72,9 +73,10 @@ pub(crate) fn build_report(args: &MakeArgs) -> Result<MakeReport> {
     let artifact = make_artifact_path(&make_dir, &package, args.target);
 
     let mut warnings = package.warnings().to_vec();
-    if args.target == MakeTarget::Deb && package.platform() != "linux" {
+    if matches!(args.target, MakeTarget::Deb | MakeTarget::Rpm) && package.platform() != "linux" {
         warnings.push(format!(
-            "Deb maker only supports linux packages; target platform is {}.",
+            "{} maker only supports linux packages; target platform is {}.",
+            args.target.as_str(),
             package.platform()
         ));
     }
@@ -136,6 +138,7 @@ pub(crate) fn execute_make(report: &mut MakeReport, args: &MakeArgs) -> Result<(
             write_zip_archive(Path::new(report.package.bundle_dir().as_str()), artifact)?
         }
         MakeTarget::Deb => write_deb_archive(&report.package, artifact)?,
+        MakeTarget::Rpm => write_rpm_archive(&report.package, artifact)?,
     }
 
     Ok(())
@@ -194,6 +197,12 @@ fn make_artifact_path(make_dir: &Path, package: &PackageReport, target: MakeTarg
             debian_package_name(&package.artifact_stem()),
             debian_version(package.project().version.as_deref()),
             debian_arch(package.arch())
+        )),
+        MakeTarget::Rpm => make_dir.join(format!(
+            "{}-{}-1.{}.rpm",
+            rpm_package_name(&package.artifact_stem()),
+            rpm_version(package.project().version.as_deref()),
+            rpm_arch(package.arch())
         )),
     }
 }
@@ -337,6 +346,82 @@ fn write_deb_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
     )
 }
 
+fn write_rpm_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
+    if package.platform() != "linux" {
+        bail!(
+            "RPM maker only supports linux packages. Requested {}.",
+            package.platform()
+        );
+    }
+
+    let source = Path::new(package.bundle_dir().as_str());
+    if !source.exists() {
+        bail!("Package output does not exist: {}", source.display());
+    }
+
+    let parent = artifact
+        .parent()
+        .with_context(|| format!("Artifact path has no parent: {}", artifact.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("Could not create {}", parent.display()))?;
+
+    let rpm_package = rpm_package_name(&package.artifact_stem());
+    let version = rpm_version(package.project().version.as_deref());
+    let arch = rpm_arch(package.arch());
+    let executable = format!("/opt/{rpm_package}/{}", package.executable_name());
+    let mut builder = PackageBuilder::new(
+        &rpm_package,
+        &version,
+        package
+            .project()
+            .license
+            .as_deref()
+            .unwrap_or("LicenseRef-unknown"),
+        &arch,
+        &single_line(package.app_name()),
+    );
+    builder
+        .using_config(
+            BuildConfig::v4()
+                .compression(CompressionType::Gzip)
+                .reserved_space(None)
+                .source_date(0),
+        )
+        .release("1")
+        .vendor("electron-cli")
+        .packager("electron-cli")
+        .description(format!(
+            "{} packaged by electron-cli.",
+            single_line(package.app_name())
+        ))
+        .default_file_attrs(None, Some("root".to_string()), Some("root".to_string()))
+        .default_dir_attrs(None, Some("root".to_string()), Some("root".to_string()));
+
+    for directory in [
+        "/opt",
+        "/usr",
+        "/usr/bin",
+        "/usr/share",
+        "/usr/share/applications",
+    ] {
+        builder.with_dir_entry(FileOptions::dir(directory).permissions(0o755))?;
+    }
+
+    builder.with_dir(source, format!("/opt/{rpm_package}"), |options| options)?;
+    builder.with_symlink(FileOptions::symlink(
+        format!("/usr/bin/{rpm_package}"),
+        &executable,
+    ))?;
+    builder.with_file_contents(
+        rpm_desktop_file(package, &rpm_package, &executable),
+        FileOptions::new(format!("/usr/share/applications/{rpm_package}.desktop"))
+            .permissions(0o644),
+    )?;
+
+    let rpm = builder.build()?;
+    rpm.write_file(artifact)
+        .with_context(|| format!("Could not write {}", artifact.display()))
+}
+
 fn debian_control_file(
     package: &PackageReport,
     deb_package: &str,
@@ -397,6 +482,14 @@ fn append_deb_data_tar(
 }
 
 fn debian_desktop_file(package: &PackageReport, deb_package: &str, executable: &str) -> String {
+    desktop_file(package, deb_package, executable)
+}
+
+fn rpm_desktop_file(package: &PackageReport, rpm_package: &str, executable: &str) -> String {
+    desktop_file(package, rpm_package, executable)
+}
+
+fn desktop_file(package: &PackageReport, package_name: &str, executable: &str) -> String {
     format!(
         "[Desktop Entry]\n\
          Name={name}\n\
@@ -406,7 +499,7 @@ fn debian_desktop_file(package: &PackageReport, deb_package: &str, executable: &
          StartupWMClass={wm_class}\n\
          Categories=Utility;\n",
         name = single_line(package.app_name()),
-        wm_class = deb_package
+        wm_class = package_name
     )
 }
 
@@ -603,6 +696,14 @@ fn directory_size(path: &Path) -> Result<u64> {
 }
 
 fn debian_package_name(name: &str) -> String {
+    package_name(name)
+}
+
+fn rpm_package_name(name: &str) -> String {
+    package_name(name)
+}
+
+fn package_name(name: &str) -> String {
     let mut package = name
         .to_ascii_lowercase()
         .chars()
@@ -646,11 +747,43 @@ fn debian_version(version: Option<&str>) -> String {
     }
 }
 
+fn rpm_version(version: Option<&str>) -> String {
+    let version = version.unwrap_or("0.1.0");
+    let sanitized = version
+        .chars()
+        .map(|char| {
+            if char.is_ascii_alphanumeric() || matches!(char, '.' | '+' | '_' | '~') {
+                char
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(['_', '~'])
+        .to_string();
+
+    if sanitized.is_empty() {
+        "0.1.0".to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn debian_arch(arch: &str) -> String {
     match arch {
         "x64" => "amd64".to_string(),
         "ia32" => "i386".to_string(),
         "armv7l" => "armhf".to_string(),
+        arch => arch.to_string(),
+    }
+}
+
+fn rpm_arch(arch: &str) -> String {
+    match arch {
+        "x64" => "x86_64".to_string(),
+        "arm64" => "aarch64".to_string(),
+        "ia32" => "i386".to_string(),
+        "armv7l" => "armv7hl".to_string(),
         arch => arch.to_string(),
     }
 }
@@ -804,6 +937,40 @@ mod tests {
     }
 
     #[test]
+    fn builds_make_report_for_rpm_target() {
+        let root = unique_temp_dir("rpm-plan");
+        write_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("linux".to_string()),
+            arch: Some("x64".to_string()),
+            target: crate::cli::MakeTarget::Rpm,
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let report = build_report(&args).expect("report should build");
+
+        assert_eq!(report.target, "rpm");
+        assert!(Path::new(report.artifact.as_str()).ends_with(
+            PathBuf::from("out")
+                .join("make")
+                .join("rpm")
+                .join("linux")
+                .join("x64")
+                .join("starter-app-0.1.0-1.x86_64.rpm")
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn makes_zip_artifact_after_packaging() {
         let root = unique_temp_dir("execute");
         write_package_json(&root);
@@ -905,6 +1072,65 @@ mod tests {
     }
 
     #[test]
+    fn writes_rpm_archive_with_metadata_and_payload_entries() {
+        let root = unique_temp_dir("rpm-archive");
+        write_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("linux".to_string()),
+            arch: Some("x64".to_string()),
+            target: crate::cli::MakeTarget::Rpm,
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let report = build_report(&args).expect("report should build");
+        let bundle_dir = Path::new(report.package.bundle_dir().as_str());
+        fs::create_dir_all(bundle_dir.join("resources/app"))
+            .expect("fake bundle resources should be created");
+        fs::write(bundle_dir.join("starter-app"), "").expect("fake binary should be written");
+        fs::write(bundle_dir.join("resources/app/package.json"), "{}")
+            .expect("fake app package should be written");
+
+        write_rpm_archive(&report.package, Path::new(report.artifact.as_str()))
+            .expect("rpm should be written");
+
+        let rpm = rpm::Package::open(report.artifact.as_str()).expect("rpm should parse");
+        assert_eq!(
+            rpm.metadata.get_name().expect("name should read"),
+            "starter-app"
+        );
+        assert_eq!(
+            rpm.metadata.get_version().expect("version should read"),
+            "0.1.0"
+        );
+        assert_eq!(
+            rpm.metadata.get_release().expect("release should read"),
+            "1"
+        );
+        assert_eq!(rpm.metadata.get_arch().expect("arch should read"), "x86_64");
+
+        let paths = rpm
+            .metadata
+            .get_file_paths()
+            .expect("file paths should read")
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"/opt/starter-app/resources/app/package.json".to_string()));
+        assert!(paths.contains(&"/usr/share/applications/starter-app.desktop".to_string()));
+        assert!(paths.contains(&"/usr/bin/starter-app".to_string()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn makes_deb_artifact_after_packaging_on_linux() {
         if !cfg!(target_os = "linux") {
             return;
@@ -936,10 +1162,42 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn makes_rpm_artifact_after_packaging_on_linux() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+
+        let root = unique_temp_dir("rpm-execute");
+        write_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            target: crate::cli::MakeTarget::Rpm,
+            skip_package: false,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let mut report = build_report(&args).expect("report should build");
+
+        execute_make(&mut report, &args).expect("make should succeed");
+
+        assert!(Path::new(report.artifact.as_str()).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn write_package_json(root: &Path) {
         fs::write(
             root.join("package.json"),
-            r#"{"name":"starter-app","version":"0.1.0","main":"src/main.js","devDependencies":{"electron":"30.0.0"}}"#,
+            r#"{"name":"starter-app","version":"0.1.0","license":"MIT","main":"src/main.js","devDependencies":{"electron":"30.0.0"}}"#,
         )
         .expect("package.json should be written");
     }

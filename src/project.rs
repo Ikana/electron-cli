@@ -15,6 +15,7 @@ pub struct ProjectSnapshot {
     pub package_json: Option<Utf8PathBuf>,
     pub name: Option<String>,
     pub version: Option<String>,
+    pub license: Option<String>,
     pub main: Option<String>,
     pub package_manager: Option<String>,
     pub scripts: BTreeMap<String, String>,
@@ -126,6 +127,11 @@ pub fn inspect(cwd: &Path) -> Result<ProjectSnapshot> {
         version: package_json
             .as_ref()
             .and_then(|package| package.get("version"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        license: package_json
+            .as_ref()
+            .and_then(|package| package.get("license"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         main: package_json
