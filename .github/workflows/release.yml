@@ -33,10 +33,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
+          prerelease_flag=""
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --title "$RELEASE_TAG" \
+              $prerelease_flag \
               --notes "Experimental alpha release for electron-cli."
 
   build:

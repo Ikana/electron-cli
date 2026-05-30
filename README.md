@@ -14,17 +14,18 @@ Current commands:
 electron-cli inspect
 electron-cli doctor
 electron-cli plan
+electron-cli init my-app --dry-run
 electron-cli inspect --json
 electron-cli doctor --json
 electron-cli plan --json
+electron-cli init my-app --dry-run --json
 ```
 
 Planned commands:
 
 ```sh
-electron-cli dev
-electron-cli init
 electron-cli package
+electron-cli dev
 electron-cli make
 ```
 
@@ -35,7 +36,7 @@ The planned workflow commands may start by wrapping Electron Forge or other esta
 During the experimental phase, the npm package downloads a prebuilt binary from GitHub Releases when one is available. If a prebuilt binary is not available for your platform, it falls back to running from Rust source.
 
 ```sh
-npm install -g electron-cli
+npm install -g electron-cli@alpha
 electron-cli doctor
 ```
 
@@ -59,6 +60,7 @@ Or use Cargo directly:
 ```sh
 cargo run -- doctor
 cargo run -- inspect --json
+cargo run -- init my-app --dry-run
 ```
 
 ## Design Goals
@@ -77,8 +79,9 @@ cargo run -- inspect --json
 
 ## JSON Output
 
-Both initial commands support `--json` so agents and scripts can consume project state without scraping terminal output.
+The inspection and planning commands support `--json` so agents and scripts can consume project state without scraping terminal output.
 `plan` is designed around that workflow: it recommends stable commands and reports missing project conventions as structured data.
+`init --dry-run --json` shows the exact create command before running any networked tooling.
 
 ```sh
 electron-cli plan --json
