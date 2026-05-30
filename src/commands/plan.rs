@@ -83,7 +83,9 @@ fn build_report(snapshot: &project::ProjectSnapshot) -> PlanReport {
     let mut risks = Vec::new();
     let mut notes = Vec::new();
 
-    if let Some(script) = first_script(snapshot, &["start", "dev"]) {
+    if matches!(project_type, ProjectType::Electron) && snapshot.main.is_some() {
+        recommended_commands.insert("dev".to_string(), "electron-cli start".to_string());
+    } else if let Some(script) = first_script(snapshot, &["start", "dev"]) {
         recommended_commands.insert("dev".to_string(), run_script(snapshot, script));
     } else if snapshot.electron_dependency.is_some() && snapshot.main.is_some() {
         recommended_commands.insert("dev".to_string(), package_exec(snapshot, "electron ."));
@@ -94,7 +96,9 @@ fn build_report(snapshot: &project::ProjectSnapshot) -> PlanReport {
         missing.push("No start or dev script was found.".to_string());
     }
 
-    if let Some(script) = first_script(snapshot, &["package", "pack"]) {
+    if matches!(project_type, ProjectType::Electron) && snapshot.main.is_some() {
+        recommended_commands.insert("package".to_string(), "electron-cli package".to_string());
+    } else if let Some(script) = first_script(snapshot, &["package", "pack"]) {
         recommended_commands.insert("package".to_string(), run_script(snapshot, script));
     } else if matches!(project_type, ProjectType::ElectronForge) {
         missing.push(
@@ -134,9 +138,9 @@ fn build_report(snapshot: &project::ProjectSnapshot) -> PlanReport {
     }
 
     if matches!(project_type, ProjectType::ElectronForge) {
-        notes.push("Electron Forge was detected; wrapping Forge commands is the safest workflow path today.".to_string());
+        notes.push("Electron Forge was detected; its scripts remain the safest path for Forge-managed apps today.".to_string());
     } else if snapshot.electron_dependency.is_some() {
-        notes.push("Electron was detected without Forge; prefer inspection before choosing a packaging path.".to_string());
+        notes.push("Electron was detected without Forge; electron-cli can start and package the current-platform app directly.".to_string());
     } else {
         notes.push("This does not currently look like an Electron app.".to_string());
     }
@@ -231,5 +235,40 @@ mod tests {
             Some("npm run package")
         );
         assert!(report.risks.is_empty());
+    }
+
+    #[test]
+    fn plans_native_electron_cli_flow_for_plain_electron_app() {
+        let snapshot = project::ProjectSnapshot {
+            root: camino::Utf8PathBuf::from("/tmp/native-app"),
+            package_json: Some(camino::Utf8PathBuf::from("/tmp/native-app/package.json")),
+            name: Some("native-app".to_string()),
+            version: Some("0.1.0".to_string()),
+            main: Some("src/main.js".to_string()),
+            package_manager: Some("npm".to_string()),
+            scripts: BTreeMap::new(),
+            dependencies: BTreeMap::new(),
+            dev_dependencies: BTreeMap::from([("electron".to_string(), "30.0.0".to_string())]),
+            optional_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            electron_dependency: Some("30.0.0".to_string()),
+            forge_dependencies: BTreeMap::new(),
+            signals: vec!["electron dependency declared".to_string()],
+        };
+
+        let report = build_report(&snapshot);
+
+        assert!(matches!(report.project_type, ProjectType::Electron));
+        assert_eq!(
+            report.recommended_commands.get("dev").map(String::as_str),
+            Some("electron-cli start")
+        );
+        assert_eq!(
+            report
+                .recommended_commands
+                .get("package")
+                .map(String::as_str),
+            Some("electron-cli package")
+        );
     }
 }

@@ -18,12 +18,16 @@ pub struct Cli {
 pub enum Commands {
     /// Check whether the current project looks ready for Electron development.
     Doctor(CommandArgs),
-    /// Bootstrap a new Electron app through the Electron Forge create tooling.
+    /// Bootstrap a new Electron app.
     Init(InitArgs),
     /// Print a structured snapshot of the current JavaScript/Electron project.
     Inspect(CommandArgs),
+    /// Create a local Electron application bundle without Electron Forge.
+    Package(PackageArgs),
     /// Recommend next commands and risks from the project snapshot.
     Plan(CommandArgs),
+    /// Launch the current Electron app without Electron Forge.
+    Start(StartArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -47,8 +51,8 @@ pub struct InitArgs {
     #[arg(long, default_value = ".", value_name = "PATH")]
     pub cwd: PathBuf,
 
-    /// Forge template to use.
-    #[arg(long, short = 't', default_value = "vite-typescript")]
+    /// Template to use. "minimal" is native; other names are passed to create-electron-app.
+    #[arg(long, short = 't', default_value = "minimal")]
     pub template: String,
 
     /// Package manager command strategy to use.
@@ -72,6 +76,60 @@ pub struct InitArgs {
     pub skip_git: bool,
 
     /// Print the command and metadata without creating files.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct StartArgs {
+    /// Project directory to launch.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub cwd: PathBuf,
+
+    /// Print the launch command without starting Electron.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Extra arguments passed to Electron after `--`.
+    #[arg(last = true, value_name = "ELECTRON_ARG")]
+    pub electron_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PackageArgs {
+    /// Project directory to package.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub cwd: PathBuf,
+
+    /// Output directory for packaged app bundles.
+    #[arg(long, default_value = "out", value_name = "PATH")]
+    pub out_dir: PathBuf,
+
+    /// Override the packaged application name.
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Target platform label. Defaults to the current platform.
+    #[arg(long)]
+    pub platform: Option<String>,
+
+    /// Target architecture label. Defaults to the current architecture.
+    #[arg(long)]
+    pub arch: Option<String>,
+
+    /// Overwrite an existing package output directory.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Print the package plan without creating files.
     #[arg(long)]
     pub dry_run: bool,
 

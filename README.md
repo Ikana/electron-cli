@@ -6,7 +6,7 @@ This is an independent learning project. It is not affiliated with Electron, Ele
 
 ## Status
 
-This repository is intentionally small and public-learning friendly. The first useful surface area is inspection and diagnostics, because those commands are valuable for humans and easy for agents to consume safely.
+This repository is intentionally small and public-learning friendly. The first useful surface area is inspection and diagnostics, because those commands are valuable for humans and easy for agents to consume safely. The next surface area is a Rust-owned version of the main Electron Forge flow: initialize, start, package, make, and eventually publish.
 
 Current commands:
 
@@ -14,22 +14,33 @@ Current commands:
 electron-cli inspect
 electron-cli doctor
 electron-cli plan
-electron-cli init my-app --dry-run
+electron-cli init my-app
+electron-cli start
+electron-cli package
 electron-cli inspect --json
 electron-cli doctor --json
 electron-cli plan --json
 electron-cli init my-app --dry-run --json
+electron-cli start --dry-run --json
+electron-cli package --dry-run --json
 ```
 
 Planned commands:
 
 ```sh
-electron-cli package
-electron-cli dev
 electron-cli make
+electron-cli publish
 ```
 
-The planned workflow commands may start by wrapping Electron Forge or other established tools. Rust-native implementations can replace narrow pieces over time when there is a clear reason.
+The default `init` template is `minimal`, a built-in starter written by this project. Non-native template names are still passed to `create-electron-app` as an escape hatch while this project grows.
+
+The Rust-native flow currently owns:
+
+- `init --template minimal`: writes a local Electron starter without Electron Forge.
+- `start`: launches the installed Electron runtime directly.
+- `package`: copies the installed Electron runtime and app files into a local app bundle for the current platform and architecture. The first package pass supports apps without production `dependencies`; dependency pruning and bundled runtime dependencies are still TODO.
+
+`make` and `publish` are not implemented yet. They are the next pieces of the Forge lifecycle to replace.
 
 ## Install
 
@@ -60,7 +71,9 @@ Or use Cargo directly:
 ```sh
 cargo run -- doctor
 cargo run -- inspect --json
-cargo run -- init my-app --dry-run
+cargo run -- init my-app
+cargo run -- start --dry-run
+cargo run -- package --dry-run
 ```
 
 ## Design Goals
@@ -68,7 +81,7 @@ cargo run -- init my-app --dry-run
 - Learn Rust through a real developer tool.
 - Make Electron project state easy to inspect.
 - Prefer structured output for agentic workflows.
-- Wrap proven ecosystem tools before replacing them.
+- Replace the main Forge-style app flow with narrow Rust-owned pieces.
 - Keep the project clearly independent and experimental.
 
 ## Non-Goals
@@ -81,7 +94,9 @@ cargo run -- init my-app --dry-run
 
 The inspection and planning commands support `--json` so agents and scripts can consume project state without scraping terminal output.
 `plan` is designed around that workflow: it recommends stable commands and reports missing project conventions as structured data.
-`init --dry-run --json` shows the exact create command before running any networked tooling.
+`init --dry-run --json` shows whether the CLI will write native template files or delegate to `create-electron-app`.
+`start --dry-run --json` shows the Electron executable that will be launched.
+`package --dry-run --json` shows the runtime and app file copy plan.
 
 ```sh
 electron-cli plan --json
