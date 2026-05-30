@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::{cli::PackageArgs, output, project::ProjectSnapshot};
 
 #[derive(Debug, Serialize)]
-struct PackageReport {
+pub(crate) struct PackageReport {
     project: ProjectSnapshot,
     app_name: String,
     executable_name: String,
@@ -54,7 +54,7 @@ pub fn run(args: PackageArgs) -> Result<()> {
     print_report(&report, args.json)
 }
 
-fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Result<PackageReport> {
+pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Result<PackageReport> {
     let root = Path::new(snapshot.root.as_str());
     let platform = args.platform.clone().unwrap_or_else(current_platform);
     let arch = args.arch.clone().unwrap_or_else(current_arch);
@@ -150,7 +150,7 @@ fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Result<Package
     })
 }
 
-fn execute_package(report: &PackageReport, force: bool) -> Result<()> {
+pub(crate) fn execute_package(report: &PackageReport, force: bool) -> Result<()> {
     if report.project.package_json.is_none() {
         bail!("No package.json found. Run electron-cli package inside an Electron project.");
     }
@@ -505,6 +505,44 @@ impl PackageStatus {
             PackageStatus::Planned => "planned",
             PackageStatus::Packaged => "packaged",
         }
+    }
+}
+
+impl PackageReport {
+    pub(crate) fn project(&self) -> &ProjectSnapshot {
+        &self.project
+    }
+
+    pub(crate) fn mark_packaged(&mut self) {
+        self.status = PackageStatus::Packaged;
+    }
+
+    pub(crate) fn app_name(&self) -> &str {
+        &self.app_name
+    }
+
+    pub(crate) fn artifact_stem(&self) -> String {
+        sanitize_artifact_name(&self.app_name)
+    }
+
+    pub(crate) fn platform(&self) -> &str {
+        &self.platform
+    }
+
+    pub(crate) fn arch(&self) -> &str {
+        &self.arch
+    }
+
+    pub(crate) fn output_dir(&self) -> &Utf8PathBuf {
+        &self.output_dir
+    }
+
+    pub(crate) fn bundle_dir(&self) -> &Utf8PathBuf {
+        &self.bundle_dir
+    }
+
+    pub(crate) fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 }
 

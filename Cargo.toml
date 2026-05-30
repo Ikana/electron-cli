@@ -1,6 +1,6 @@
 [package]
 name = "electron-cli"
-version = "0.3.0-alpha.3"
+version = "0.3.0-alpha.4"
 edition = "2021"
 description = "Experimental Rust CLI for Electron project diagnostics and workflow automation"
 license = "MIT"
@@ -12,3 +12,4 @@ camino = { version = "1.1", features = ["serde1"] }
 clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

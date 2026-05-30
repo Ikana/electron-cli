@@ -22,6 +22,8 @@ pub enum Commands {
     Init(InitArgs),
     /// Print a structured snapshot of the current JavaScript/Electron project.
     Inspect(CommandArgs),
+    /// Create distributable artifacts from a packaged Electron app.
+    Make(MakeArgs),
     /// Create a local Electron application bundle without Electron Forge.
     Package(PackageArgs),
     /// Recommend next commands and risks from the project snapshot.
@@ -138,6 +140,49 @@ pub struct PackageArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct MakeArgs {
+    /// Project directory to make distributables for.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub cwd: PathBuf,
+
+    /// Output directory used for package and make artifacts.
+    #[arg(long, default_value = "out", value_name = "PATH")]
+    pub out_dir: PathBuf,
+
+    /// Override the application name.
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Target platform label. Defaults to the current platform.
+    #[arg(long)]
+    pub platform: Option<String>,
+
+    /// Target architecture label. Defaults to the current architecture.
+    #[arg(long)]
+    pub arch: Option<String>,
+
+    /// Maker target to run.
+    #[arg(long, value_enum, default_value_t = MakeTarget::Zip)]
+    pub target: MakeTarget,
+
+    /// Reuse an existing package output instead of running package first.
+    #[arg(long)]
+    pub skip_package: bool,
+
+    /// Overwrite existing package and make artifacts.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Print the make plan without creating files.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum PackageManager {
@@ -154,6 +199,20 @@ impl PackageManager {
             PackageManager::Pnpm => "pnpm",
             PackageManager::Yarn => "yarn",
             PackageManager::Bun => "bun",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum MakeTarget {
+    Zip,
+}
+
+impl MakeTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MakeTarget::Zip => "zip",
         }
     }
 }

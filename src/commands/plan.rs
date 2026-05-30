@@ -106,7 +106,9 @@ fn build_report(snapshot: &project::ProjectSnapshot) -> PlanReport {
         );
     }
 
-    if let Some(script) = first_script(snapshot, &["make", "dist"]) {
+    if matches!(project_type, ProjectType::Electron) && snapshot.main.is_some() {
+        recommended_commands.insert("make".to_string(), "electron-cli make".to_string());
+    } else if let Some(script) = first_script(snapshot, &["make", "dist"]) {
         recommended_commands.insert("make".to_string(), run_script(snapshot, script));
     }
 
@@ -269,6 +271,10 @@ mod tests {
                 .get("package")
                 .map(String::as_str),
             Some("electron-cli package")
+        );
+        assert_eq!(
+            report.recommended_commands.get("make").map(String::as_str),
+            Some("electron-cli make")
         );
     }
 }

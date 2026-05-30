@@ -21,6 +21,7 @@ fn run() -> Result<()> {
         Commands::Doctor(args) => commands::doctor::run(args),
         Commands::Init(args) => commands::init::run(args),
         Commands::Inspect(args) => commands::inspect::run(args),
+        Commands::Make(args) => commands::make::run(args),
         Commands::Package(args) => commands::package::run(args),
         Commands::Plan(args) => commands::plan::run(args),
         Commands::Start(args) => commands::start::run(args),

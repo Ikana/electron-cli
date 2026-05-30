@@ -17,18 +17,19 @@ electron-cli plan
 electron-cli init my-app
 electron-cli start
 electron-cli package
+electron-cli make
 electron-cli inspect --json
 electron-cli doctor --json
 electron-cli plan --json
 electron-cli init my-app --dry-run --json
 electron-cli start --dry-run --json
 electron-cli package --dry-run --json
+electron-cli make --dry-run --json
 ```
 
 Planned commands:
 
 ```sh
-electron-cli make
 electron-cli publish
 ```
 
@@ -39,8 +40,9 @@ The Rust-native flow currently owns:
 - `init --template minimal`: writes a local Electron starter without Electron Forge.
 - `start`: launches the installed Electron runtime directly.
 - `package`: copies the installed Electron runtime and app files into a local app bundle for the current platform and architecture. The first package pass supports apps without production `dependencies`; dependency pruning and bundled runtime dependencies are still TODO.
+- `make`: runs `package` and writes a ZIP distributable under `out/make/zip/<platform>/<arch>/`.
 
-`make` and `publish` are not implemented yet. They are the next pieces of the Forge lifecycle to replace.
+`publish` is not implemented yet. It is the next piece of the Forge lifecycle to replace.
 
 ## Install
 
@@ -74,6 +76,7 @@ cargo run -- inspect --json
 cargo run -- init my-app
 cargo run -- start --dry-run
 cargo run -- package --dry-run
+cargo run -- make --dry-run
 ```
 
 ## Design Goals
@@ -97,6 +100,7 @@ The inspection and planning commands support `--json` so agents and scripts can 
 `init --dry-run --json` shows whether the CLI will write native template files or delegate to `create-electron-app`.
 `start --dry-run --json` shows the Electron executable that will be launched.
 `package --dry-run --json` shows the runtime and app file copy plan.
+`make --dry-run --json` shows the package prerequisite and ZIP artifact path.
 
 ```sh
 electron-cli plan --json
