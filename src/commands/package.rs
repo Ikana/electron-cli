@@ -1177,6 +1177,10 @@ impl PackageReport {
         &self.app_name
     }
 
+    pub(crate) fn executable_name(&self) -> &str {
+        &self.executable_name
+    }
+
     pub(crate) fn artifact_stem(&self) -> String {
         sanitize_artifact_name(&self.app_name)
     }

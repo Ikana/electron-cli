@@ -42,10 +42,10 @@ The Rust-native flow currently owns:
 - `init --template minimal`: writes a local Electron starter without Electron Forge.
 - `start`: launches the installed Electron runtime directly.
 - `package`: copies the installed Electron runtime, app files, installed production dependency closure, app metadata, macOS icon, and extra resources into a local app bundle for the current platform and architecture.
-- `make`: runs `package` and writes a ZIP distributable under `out/make/zip/<platform>/<arch>/`.
+- `make`: runs `package` and writes a distributable under `out/make/<target>/<platform>/<arch>/`; ZIP works on all platforms, and `--target deb` writes a Linux Debian package.
 - `publish`: runs `make` and publishes the distributable to a local directory with a manifest.
 
-Remote publishers such as GitHub Releases are not implemented yet. Platform-specific makers, Windows/Linux icon embedding, signing, and notarization are also still TODO.
+Remote publishers such as GitHub Releases are not implemented yet. DMG, RPM, Windows installers, Windows/Linux icon embedding, signing, and notarization are also still TODO.
 
 Package metadata can be configured in `package.json`:
 
@@ -98,6 +98,7 @@ cargo run -- init my-app
 cargo run -- start --dry-run
 cargo run -- package --dry-run
 cargo run -- make --dry-run
+cargo run -- make --target deb --dry-run
 cargo run -- publish --dry-run
 ```
 
@@ -122,7 +123,7 @@ The inspection and planning commands support `--json` so agents and scripts can 
 `init --dry-run --json` shows whether the CLI will write native template files or delegate to `create-electron-app`.
 `start --dry-run --json` shows the Electron executable that will be launched.
 `package --dry-run --json` shows the runtime, app file, metadata, icon, and extra-resource copy plan.
-`make --dry-run --json` shows the package prerequisite and ZIP artifact path.
+`make --dry-run --json` shows the package prerequisite and selected maker artifact path.
 `publish --dry-run --json` shows the make prerequisite, destination artifact, and manifest path.
 
 ```sh

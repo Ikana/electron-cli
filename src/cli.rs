@@ -240,7 +240,7 @@ pub struct PublishArgs {
     pub json: bool,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum PackageManager {
     Npm,
@@ -260,15 +260,17 @@ impl PackageManager {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum MakeTarget {
+    Deb,
     Zip,
 }
 
 impl MakeTarget {
     pub fn as_str(self) -> &'static str {
         match self {
+            MakeTarget::Deb => "deb",
             MakeTarget::Zip => "zip",
         }
     }

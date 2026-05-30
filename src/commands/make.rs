@@ -1,17 +1,19 @@
 use std::{
     fs,
     fs::File,
-    io::{self, BufWriter},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
+use flate2::{write::GzEncoder, Compression};
 use serde::Serialize;
+use tar::{Builder as TarBuilder, Header as TarHeader};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use crate::{
-    cli::{MakeArgs, PackageArgs},
+    cli::{MakeArgs, MakeTarget, PackageArgs},
     commands::package::{self, PackageReport},
     output,
 };
@@ -67,14 +69,15 @@ pub(crate) fn build_report(args: &MakeArgs) -> Result<MakeReport> {
         .join(args.target.as_str())
         .join(package.platform())
         .join(package.arch());
-    let artifact = make_dir.join(format!(
-        "{}-{}-{}.zip",
-        package.artifact_stem(),
-        package.platform(),
-        package.arch()
-    ));
+    let artifact = make_artifact_path(&make_dir, &package, args.target);
 
     let mut warnings = package.warnings().to_vec();
+    if args.target == MakeTarget::Deb && package.platform() != "linux" {
+        warnings.push(format!(
+            "Deb maker only supports linux packages; target platform is {}.",
+            package.platform()
+        ));
+    }
     if args.skip_package && !Path::new(package.bundle_dir().as_str()).exists() {
         warnings.push(format!(
             "Package output does not exist: {}.",
@@ -128,7 +131,12 @@ pub(crate) fn execute_make(report: &mut MakeReport, args: &MakeArgs) -> Result<(
 
     fs::create_dir_all(report.make_dir.as_str())
         .with_context(|| format!("Could not create {}", report.make_dir))?;
-    write_zip_archive(Path::new(report.package.bundle_dir().as_str()), artifact)?;
+    match args.target {
+        MakeTarget::Zip => {
+            write_zip_archive(Path::new(report.package.bundle_dir().as_str()), artifact)?
+        }
+        MakeTarget::Deb => write_deb_archive(&report.package, artifact)?,
+    }
 
     Ok(())
 }
@@ -171,6 +179,23 @@ fn print_report(report: &MakeReport, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn make_artifact_path(make_dir: &Path, package: &PackageReport, target: MakeTarget) -> PathBuf {
+    match target {
+        MakeTarget::Zip => make_dir.join(format!(
+            "{}-{}-{}.zip",
+            package.artifact_stem(),
+            package.platform(),
+            package.arch()
+        )),
+        MakeTarget::Deb => make_dir.join(format!(
+            "{}_{}_{}.deb",
+            debian_package_name(&package.artifact_stem()),
+            debian_version(package.project().version.as_deref()),
+            debian_arch(package.arch())
+        )),
+    }
 }
 
 fn write_zip_archive(source: &Path, artifact: &Path) -> Result<()> {
@@ -263,6 +288,386 @@ fn directory_options(metadata: &fs::Metadata) -> SimpleFileOptions {
         .unix_permissions(unix_mode(metadata, 0o755))
 }
 
+fn write_deb_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
+    if package.platform() != "linux" {
+        bail!(
+            "Deb maker only supports linux packages. Requested {}.",
+            package.platform()
+        );
+    }
+
+    let source = Path::new(package.bundle_dir().as_str());
+    if !source.exists() {
+        bail!("Package output does not exist: {}", source.display());
+    }
+
+    let parent = artifact
+        .parent()
+        .with_context(|| format!("Artifact path has no parent: {}", artifact.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("Could not create {}", parent.display()))?;
+
+    let deb_package = debian_package_name(&package.artifact_stem());
+    let version = debian_version(package.project().version.as_deref());
+    let arch = debian_arch(package.arch());
+    let installed_size = directory_size(source)?.div_ceil(1024).max(1);
+    let control = debian_control_file(package, &deb_package, &version, &arch, installed_size);
+    let control_tar =
+        gzip_tar(|builder| append_bytes_to_tar(builder, "./control", control.as_bytes(), 0o644))?;
+    let data_tar = gzip_tar(|builder| append_deb_data_tar(builder, package, source, &deb_package))?;
+
+    write_ar_archive(
+        artifact,
+        &[
+            ArMember {
+                name: "debian-binary",
+                mode: 0o100644,
+                data: b"2.0\n".to_vec(),
+            },
+            ArMember {
+                name: "control.tar.gz",
+                mode: 0o100644,
+                data: control_tar,
+            },
+            ArMember {
+                name: "data.tar.gz",
+                mode: 0o100644,
+                data: data_tar,
+            },
+        ],
+    )
+}
+
+fn debian_control_file(
+    package: &PackageReport,
+    deb_package: &str,
+    version: &str,
+    arch: &str,
+    installed_size: u64,
+) -> String {
+    format!(
+        "Package: {deb_package}\n\
+         Version: {version}\n\
+         Section: utils\n\
+         Priority: optional\n\
+         Architecture: {arch}\n\
+         Maintainer: electron-cli <noreply@example.invalid>\n\
+         Installed-Size: {installed_size}\n\
+         Description: {description}\n\
+          Electron application packaged by electron-cli.\n",
+        description = single_line(package.app_name())
+    )
+}
+
+fn append_deb_data_tar(
+    builder: &mut TarBuilder<GzEncoder<Vec<u8>>>,
+    package: &PackageReport,
+    source: &Path,
+    deb_package: &str,
+) -> Result<()> {
+    for directory in [
+        "./",
+        "./opt",
+        "./usr",
+        "./usr/bin",
+        "./usr/share",
+        "./usr/share/applications",
+    ] {
+        append_directory_to_tar(builder, directory, 0o755)?;
+    }
+
+    let app_root = format!("./opt/{deb_package}");
+    append_directory_to_tar(builder, &app_root, 0o755)?;
+    append_directory_contents_to_tar(builder, source, Path::new(&app_root))?;
+
+    let executable = format!("/opt/{deb_package}/{}", package.executable_name());
+    append_symlink_to_tar(
+        builder,
+        format!("./usr/bin/{deb_package}"),
+        &executable,
+        0o777,
+    )?;
+    append_bytes_to_tar(
+        builder,
+        format!("./usr/share/applications/{deb_package}.desktop"),
+        debian_desktop_file(package, deb_package, &executable).as_bytes(),
+        0o644,
+    )?;
+
+    Ok(())
+}
+
+fn debian_desktop_file(package: &PackageReport, deb_package: &str, executable: &str) -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Name={name}\n\
+         Exec={executable} %U\n\
+         Terminal=false\n\
+         Type=Application\n\
+         StartupWMClass={wm_class}\n\
+         Categories=Utility;\n",
+        name = single_line(package.app_name()),
+        wm_class = deb_package
+    )
+}
+
+fn gzip_tar(
+    write_contents: impl FnOnce(&mut TarBuilder<GzEncoder<Vec<u8>>>) -> Result<()>,
+) -> Result<Vec<u8>> {
+    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut builder = TarBuilder::new(encoder);
+    builder.mode(tar::HeaderMode::Deterministic);
+    write_contents(&mut builder)?;
+    builder.finish().context("Could not finish tar archive")?;
+    let encoder = builder
+        .into_inner()
+        .context("Could not retrieve gzip encoder")?;
+    encoder.finish().context("Could not finish gzip archive")
+}
+
+fn append_directory_contents_to_tar(
+    builder: &mut TarBuilder<GzEncoder<Vec<u8>>>,
+    source: &Path,
+    destination: &Path,
+) -> Result<()> {
+    let mut entries = fs::read_dir(source)
+        .with_context(|| format!("Could not read {}", source.display()))?
+        .collect::<Result<Vec<_>, io::Error>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        append_path_to_tar(builder, &source_path, &destination_path)?;
+    }
+
+    Ok(())
+}
+
+fn append_path_to_tar(
+    builder: &mut TarBuilder<GzEncoder<Vec<u8>>>,
+    source: &Path,
+    destination: &Path,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("Could not stat {}", source.display()))?;
+
+    if metadata.is_dir() {
+        append_directory_to_tar(builder, destination, unix_mode(&metadata, 0o755))?;
+        append_directory_contents_to_tar(builder, source, destination)?;
+    } else if metadata.file_type().is_symlink() {
+        let target = fs::read_link(source)
+            .with_context(|| format!("Could not read link {}", source.display()))?;
+        append_symlink_to_tar(builder, destination, &target, 0o777)?;
+    } else if metadata.is_file() {
+        append_file_to_tar(builder, source, destination, &metadata)?;
+    }
+
+    Ok(())
+}
+
+fn append_directory_to_tar(
+    builder: &mut TarBuilder<GzEncoder<Vec<u8>>>,
+    path: impl AsRef<Path>,
+    mode: u32,
+) -> Result<()> {
+    let mut header = TarHeader::new_gnu();
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_size(0);
+    header.set_mode(mode);
+    header.set_mtime(0);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path.as_ref(), io::empty())
+        .with_context(|| format!("Could not add {} to data tar", path.as_ref().display()))
+}
+
+fn append_file_to_tar(
+    builder: &mut TarBuilder<GzEncoder<Vec<u8>>>,
+    source: &Path,
+    destination: &Path,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    let mut header = TarHeader::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(metadata.len());
+    header.set_mode(unix_mode(metadata, 0o644));
+    header.set_mtime(0);
+    header.set_cksum();
+    let mut file =
+        File::open(source).with_context(|| format!("Could not open {}", source.display()))?;
+    builder
+        .append_data(&mut header, destination, &mut file)
+        .with_context(|| format!("Could not add {} to data tar", source.display()))
+}
+
+fn append_bytes_to_tar(
+    builder: &mut TarBuilder<GzEncoder<Vec<u8>>>,
+    path: impl AsRef<Path>,
+    contents: &[u8],
+    mode: u32,
+) -> Result<()> {
+    let mut header = TarHeader::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(contents.len() as u64);
+    header.set_mode(mode);
+    header.set_mtime(0);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path.as_ref(), contents)
+        .with_context(|| format!("Could not add {} to tar", path.as_ref().display()))
+}
+
+fn append_symlink_to_tar(
+    builder: &mut TarBuilder<GzEncoder<Vec<u8>>>,
+    path: impl AsRef<Path>,
+    target: impl AsRef<Path>,
+    mode: u32,
+) -> Result<()> {
+    let mut header = TarHeader::new_gnu();
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_size(0);
+    header.set_mode(mode);
+    header.set_mtime(0);
+    header
+        .set_link_name(target.as_ref())
+        .with_context(|| format!("Could not set link target for {}", path.as_ref().display()))?;
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path.as_ref(), io::empty())
+        .with_context(|| format!("Could not add {} to tar", path.as_ref().display()))
+}
+
+struct ArMember {
+    name: &'static str,
+    mode: u32,
+    data: Vec<u8>,
+}
+
+fn write_ar_archive(artifact: &Path, members: &[ArMember]) -> Result<()> {
+    let mut file = BufWriter::new(
+        File::create(artifact)
+            .with_context(|| format!("Could not create {}", artifact.display()))?,
+    );
+    file.write_all(b"!<arch>\n")
+        .with_context(|| format!("Could not write {}", artifact.display()))?;
+
+    for member in members {
+        write_ar_member(&mut file, member)
+            .with_context(|| format!("Could not add {} to {}", member.name, artifact.display()))?;
+    }
+
+    file.flush()
+        .with_context(|| format!("Could not finish {}", artifact.display()))
+}
+
+fn write_ar_member(writer: &mut impl Write, member: &ArMember) -> Result<()> {
+    let name = format!("{}/", member.name);
+    if name.len() > 16 {
+        bail!("ar member name is too long: {}", member.name);
+    }
+
+    let header = format!(
+        "{name:<16}{mtime:<12}{uid:<6}{gid:<6}{mode:<8o}{size:<10}`\n",
+        mtime = 0,
+        uid = 0,
+        gid = 0,
+        mode = member.mode,
+        size = member.data.len()
+    );
+    debug_assert_eq!(header.len(), 60);
+    writer.write_all(header.as_bytes())?;
+    writer.write_all(&member.data)?;
+    if member.data.len() % 2 == 1 {
+        writer.write_all(b"\n")?;
+    }
+
+    Ok(())
+}
+
+fn directory_size(path: &Path) -> Result<u64> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("Could not stat {}", path.display()))?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut size = 0;
+    for entry in fs::read_dir(path).with_context(|| format!("Could not read {}", path.display()))? {
+        let entry = entry?;
+        size += directory_size(&entry.path())?;
+    }
+    Ok(size)
+}
+
+fn debian_package_name(name: &str) -> String {
+    let mut package = name
+        .to_ascii_lowercase()
+        .chars()
+        .map(|char| {
+            if char.is_ascii_alphanumeric() || matches!(char, '+' | '-' | '.') {
+                char
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(['+', '-', '.'])
+        .to_string();
+
+    if package.len() < 2 {
+        package.push_str("app");
+    }
+
+    package
+}
+
+fn debian_version(version: Option<&str>) -> String {
+    let version = version.unwrap_or("0.1.0");
+    let sanitized = version
+        .chars()
+        .map(|char| {
+            if char.is_ascii_alphanumeric() || matches!(char, '.' | '+' | '-' | ':' | '~') {
+                char
+            } else {
+                '~'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(['-', '~'])
+        .to_string();
+
+    if sanitized.is_empty() {
+        "0.1.0".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn debian_arch(arch: &str) -> String {
+    match arch {
+        "x64" => "amd64".to_string(),
+        "ia32" => "i386".to_string(),
+        "armv7l" => "armhf".to_string(),
+        arch => arch.to_string(),
+    }
+}
+
+fn single_line(value: &str) -> String {
+    value
+        .chars()
+        .map(|char| {
+            if char == '\n' || char == '\r' {
+                ' '
+            } else {
+                char
+            }
+        })
+        .collect()
+}
+
 #[cfg(unix)]
 fn unix_mode(metadata: &fs::Metadata, _fallback: u32) -> u32 {
     use std::os::unix::fs::PermissionsExt;
@@ -324,6 +729,7 @@ impl MakeReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use zip::ZipArchive;
 
     #[test]
@@ -359,6 +765,40 @@ mod tests {
                 report.package.arch()
             ));
         assert!(Path::new(report.artifact.as_str()).ends_with(expected_suffix));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builds_make_report_for_deb_target() {
+        let root = unique_temp_dir("deb-plan");
+        write_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("linux".to_string()),
+            arch: Some("x64".to_string()),
+            target: crate::cli::MakeTarget::Deb,
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let report = build_report(&args).expect("report should build");
+
+        assert_eq!(report.target, "deb");
+        assert!(Path::new(report.artifact.as_str()).ends_with(
+            PathBuf::from("out")
+                .join("make")
+                .join("deb")
+                .join("linux")
+                .join("x64")
+                .join("starter-app_0.1.0_amd64.deb")
+        ));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -405,6 +845,97 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn writes_deb_archive_with_control_and_data_members() {
+        let root = unique_temp_dir("deb-archive");
+        write_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("linux".to_string()),
+            arch: Some("x64".to_string()),
+            target: crate::cli::MakeTarget::Deb,
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let report = build_report(&args).expect("report should build");
+        let bundle_dir = Path::new(report.package.bundle_dir().as_str());
+        fs::create_dir_all(bundle_dir.join("resources/app"))
+            .expect("fake bundle resources should be created");
+        fs::write(bundle_dir.join("starter-app"), "").expect("fake binary should be written");
+        fs::write(bundle_dir.join("resources/app/package.json"), "{}")
+            .expect("fake app package should be written");
+
+        write_deb_archive(&report.package, Path::new(report.artifact.as_str()))
+            .expect("deb should be written");
+
+        let members = read_ar_members(Path::new(report.artifact.as_str()));
+        assert_eq!(
+            members.get("debian-binary").map(Vec::as_slice),
+            Some(&b"2.0\n"[..])
+        );
+
+        let control = read_tar_file(
+            members
+                .get("control.tar.gz")
+                .expect("control tar should exist"),
+            "control",
+        );
+        assert!(control.contains("Package: starter-app"));
+        assert!(control.contains("Architecture: amd64"));
+
+        let data = members.get("data.tar.gz").expect("data tar should exist");
+        assert!(tar_contains(
+            data,
+            "opt/starter-app/resources/app/package.json"
+        ));
+        assert!(tar_contains(
+            data,
+            "usr/share/applications/starter-app.desktop"
+        ));
+        assert!(tar_contains(data, "usr/bin/starter-app"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn makes_deb_artifact_after_packaging_on_linux() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+
+        let root = unique_temp_dir("deb-execute");
+        write_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            target: crate::cli::MakeTarget::Deb,
+            skip_package: false,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let mut report = build_report(&args).expect("report should build");
+
+        execute_make(&mut report, &args).expect("make should succeed");
+
+        assert!(Path::new(report.artifact.as_str()).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn write_package_json(root: &Path) {
         fs::write(
             root.join("package.json"),
@@ -445,5 +976,72 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("temp dir should be created");
         path
+    }
+
+    fn read_ar_members(path: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let bytes = fs::read(path).expect("ar archive should be readable");
+        assert_eq!(&bytes[..8], b"!<arch>\n");
+
+        let mut members = std::collections::BTreeMap::new();
+        let mut offset = 8;
+        while offset < bytes.len() {
+            let header = &bytes[offset..offset + 60];
+            let name = std::str::from_utf8(&header[0..16])
+                .expect("member name should be utf-8")
+                .trim()
+                .trim_end_matches('/')
+                .to_string();
+            let size = std::str::from_utf8(&header[48..58])
+                .expect("member size should be utf-8")
+                .trim()
+                .parse::<usize>()
+                .expect("member size should parse");
+            let data_start = offset + 60;
+            let data_end = data_start + size;
+            members.insert(name, bytes[data_start..data_end].to_vec());
+            offset = data_end + (size % 2);
+        }
+
+        members
+    }
+
+    fn read_tar_file(archive: &[u8], path: &str) -> String {
+        let decoder = flate2::read::GzDecoder::new(archive);
+        let mut archive = tar::Archive::new(decoder);
+        for entry in archive.entries().expect("tar entries should read") {
+            let mut entry = entry.expect("tar entry should read");
+            let entry_path = entry
+                .path()
+                .expect("tar path should read")
+                .to_string_lossy()
+                .trim_start_matches("./")
+                .to_string();
+            if entry_path == path {
+                let mut contents = String::new();
+                entry
+                    .read_to_string(&mut contents)
+                    .expect("tar file should read");
+                return contents;
+            }
+        }
+
+        panic!("tar file was not found: {path}");
+    }
+
+    fn tar_contains(archive: &[u8], path: &str) -> bool {
+        let decoder = flate2::read::GzDecoder::new(archive);
+        let mut archive = tar::Archive::new(decoder);
+        archive
+            .entries()
+            .expect("tar entries should read")
+            .any(|entry| {
+                entry
+                    .expect("tar entry should read")
+                    .path()
+                    .expect("tar path should read")
+                    .to_string_lossy()
+                    .trim_start_matches("./")
+                    == path
+            })
     }
 }
