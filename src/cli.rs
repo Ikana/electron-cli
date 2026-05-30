@@ -28,6 +28,8 @@ pub enum Commands {
     Package(PackageArgs),
     /// Recommend next commands and risks from the project snapshot.
     Plan(CommandArgs),
+    /// Publish made artifacts to a distribution target.
+    Publish(PublishArgs),
     /// Launch the current Electron app without Electron Forge.
     Start(StartArgs),
 }
@@ -183,6 +185,61 @@ pub struct MakeArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct PublishArgs {
+    /// Project directory to publish from.
+    #[arg(long, default_value = ".", value_name = "PATH")]
+    pub cwd: PathBuf,
+
+    /// Output directory used for package, make, and publish artifacts.
+    #[arg(long, default_value = "out", value_name = "PATH")]
+    pub out_dir: PathBuf,
+
+    /// Override the application name.
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Target platform label. Defaults to the current platform.
+    #[arg(long)]
+    pub platform: Option<String>,
+
+    /// Target architecture label. Defaults to the current architecture.
+    #[arg(long)]
+    pub arch: Option<String>,
+
+    /// Maker target whose artifact should be published.
+    #[arg(long, value_enum, default_value_t = MakeTarget::Zip)]
+    pub target: MakeTarget,
+
+    /// Publisher target to use.
+    #[arg(long, value_enum, default_value_t = PublishTarget::Local)]
+    pub publisher: PublishTarget,
+
+    /// Destination for local published artifacts.
+    #[arg(long, default_value = "out/publish/local", value_name = "PATH")]
+    pub to: PathBuf,
+
+    /// Release channel label written into the publish manifest.
+    #[arg(long, default_value = "default")]
+    pub channel: String,
+
+    /// Reuse an existing make artifact instead of running package and make first.
+    #[arg(long)]
+    pub skip_make: bool,
+
+    /// Overwrite existing publish artifacts.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Print the publish plan without creating files.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum PackageManager {
@@ -213,6 +270,20 @@ impl MakeTarget {
     pub fn as_str(self) -> &'static str {
         match self {
             MakeTarget::Zip => "zip",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum PublishTarget {
+    Local,
+}
+
+impl PublishTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PublishTarget::Local => "local",
         }
     }
 }

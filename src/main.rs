@@ -24,6 +24,7 @@ fn run() -> Result<()> {
         Commands::Make(args) => commands::make::run(args),
         Commands::Package(args) => commands::package::run(args),
         Commands::Plan(args) => commands::plan::run(args),
+        Commands::Publish(args) => commands::publish::run(args),
         Commands::Start(args) => commands::start::run(args),
     }
 }

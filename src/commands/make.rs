@@ -17,7 +17,7 @@ use crate::{
 };
 
 #[derive(Debug, Serialize)]
-struct MakeReport {
+pub(crate) struct MakeReport {
     package: PackageReport,
     target: String,
     skip_package: bool,
@@ -44,17 +44,12 @@ pub fn run(args: MakeArgs) -> Result<()> {
     }
 
     execute_make(&mut report, &args)?;
-    report.status = MakeStatus::Made;
-    report.artifact_size = Some(
-        fs::metadata(report.artifact.as_str())
-            .with_context(|| format!("Could not stat {}", report.artifact))?
-            .len(),
-    );
+    report.mark_made()?;
 
     print_report(&report, args.json)
 }
 
-fn build_report(args: &MakeArgs) -> Result<MakeReport> {
+pub(crate) fn build_report(args: &MakeArgs) -> Result<MakeReport> {
     let package_args = PackageArgs {
         cwd: args.cwd.clone(),
         out_dir: args.out_dir.clone(),
@@ -107,7 +102,7 @@ fn build_report(args: &MakeArgs) -> Result<MakeReport> {
     })
 }
 
-fn execute_make(report: &mut MakeReport, args: &MakeArgs) -> Result<()> {
+pub(crate) fn execute_make(report: &mut MakeReport, args: &MakeArgs) -> Result<()> {
     if !args.skip_package {
         package::execute_package(&report.package, args.force)?;
         report.package.mark_packaged();
@@ -295,6 +290,34 @@ impl MakeStatus {
             MakeStatus::Planned => "planned",
             MakeStatus::Made => "made",
         }
+    }
+}
+
+impl MakeReport {
+    pub(crate) fn mark_made(&mut self) -> Result<()> {
+        self.status = MakeStatus::Made;
+        self.artifact_size = Some(
+            fs::metadata(self.artifact.as_str())
+                .with_context(|| format!("Could not stat {}", self.artifact))?
+                .len(),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn package(&self) -> &PackageReport {
+        &self.package
+    }
+
+    pub(crate) fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub(crate) fn artifact(&self) -> &Utf8PathBuf {
+        &self.artifact
+    }
+
+    pub(crate) fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 }
 

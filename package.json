@@ -1,6 +1,6 @@
 {
   "name": "electron-cli",
-  "version": "0.3.0-alpha.4",
+  "version": "0.3.0-alpha.5",
   "description": "Experimental Rust CLI for Electron project diagnostics and workflow automation",
   "license": "MIT",
   "repository": {

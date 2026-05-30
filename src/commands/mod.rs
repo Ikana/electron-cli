@@ -4,4 +4,5 @@ pub mod inspect;
 pub mod make;
 pub mod package;
 pub mod plan;
+pub mod publish;
 pub mod start;

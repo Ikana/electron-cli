@@ -112,6 +112,12 @@ fn build_report(snapshot: &project::ProjectSnapshot) -> PlanReport {
         recommended_commands.insert("make".to_string(), run_script(snapshot, script));
     }
 
+    if matches!(project_type, ProjectType::Electron) && snapshot.main.is_some() {
+        recommended_commands.insert("publish".to_string(), "electron-cli publish".to_string());
+    } else if let Some(script) = first_script(snapshot, &["publish", "release"]) {
+        recommended_commands.insert("publish".to_string(), run_script(snapshot, script));
+    }
+
     recommended_commands.insert(
         "diagnostics".to_string(),
         "electron-cli doctor --json".to_string(),
@@ -142,7 +148,7 @@ fn build_report(snapshot: &project::ProjectSnapshot) -> PlanReport {
     if matches!(project_type, ProjectType::ElectronForge) {
         notes.push("Electron Forge was detected; its scripts remain the safest path for Forge-managed apps today.".to_string());
     } else if snapshot.electron_dependency.is_some() {
-        notes.push("Electron was detected without Forge; electron-cli can start and package the current-platform app directly.".to_string());
+        notes.push("Electron was detected without Forge; electron-cli can start, package, make, and publish local artifacts directly.".to_string());
     } else {
         notes.push("This does not currently look like an Electron app.".to_string());
     }
@@ -275,6 +281,13 @@ mod tests {
         assert_eq!(
             report.recommended_commands.get("make").map(String::as_str),
             Some("electron-cli make")
+        );
+        assert_eq!(
+            report
+                .recommended_commands
+                .get("publish")
+                .map(String::as_str),
+            Some("electron-cli publish")
         );
     }
 }
