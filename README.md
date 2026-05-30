@@ -41,11 +41,11 @@ The Rust-native flow currently owns:
 
 - `init --template minimal`: writes a local Electron starter without Electron Forge.
 - `start`: launches the installed Electron runtime directly.
-- `package`: copies the installed Electron runtime and app files into a local app bundle for the current platform and architecture. The first package pass supports apps without production `dependencies`; dependency pruning and bundled runtime dependencies are still TODO.
+- `package`: copies the installed Electron runtime, app files, and installed production dependency closure into a local app bundle for the current platform and architecture.
 - `make`: runs `package` and writes a ZIP distributable under `out/make/zip/<platform>/<arch>/`.
 - `publish`: runs `make` and publishes the distributable to a local directory with a manifest.
 
-Remote publishers such as GitHub Releases are not implemented yet. They are the next publisher targets to replace.
+Remote publishers such as GitHub Releases are not implemented yet. Platform-specific makers, app metadata, signing, and notarization are also still TODO.
 
 ## Install
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
 };
@@ -6,6 +7,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::{cli::PackageArgs, output, project::ProjectSnapshot};
 
@@ -87,13 +89,6 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         warnings.push("No package.json main field found.".to_string());
     }
 
-    if has_runtime_dependencies(&snapshot) {
-        warnings.push(
-            "Packaging production node_modules is not implemented yet; this project declares runtime dependencies."
-                .to_string(),
-        );
-    }
-
     if !electron_source.exists() {
         warnings.push(format!(
             "Electron runtime was not found at {}.",
@@ -115,11 +110,19 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         ));
     }
 
+    warnings.extend(runtime_dependency_warnings(root, &snapshot));
+
     let create_dirs = vec![package_root.clone(), app_resources_dir.clone()];
-    let copy_steps = [
+    let mut copy_steps = vec![
         (electron_source, bundle_dir.clone()),
         (root.to_path_buf(), app_resources_dir.join("app")),
     ];
+    if has_runtime_dependencies(&snapshot) {
+        copy_steps.push((
+            root.join("node_modules"),
+            app_resources_dir.join("app/node_modules"),
+        ));
+    }
 
     Ok(PackageReport {
         project: snapshot,
@@ -157,12 +160,6 @@ pub(crate) fn execute_package(report: &PackageReport, force: bool) -> Result<()>
 
     if report.project.electron_dependency.is_none() {
         bail!("No electron dependency found. Install Electron before packaging the app.");
-    }
-
-    if has_runtime_dependencies(&report.project) {
-        bail!(
-            "Packaging production node_modules is not implemented yet. Remove runtime dependencies or wait for dependency pruning support."
-        );
     }
 
     if report.platform != current_platform() {
@@ -222,6 +219,11 @@ pub(crate) fn execute_package(report: &PackageReport, force: bool) -> Result<()>
         Path::new(report.project.root.as_str()),
         &app_dir,
         Path::new(report.output_dir.as_str()),
+    )?;
+    copy_runtime_dependencies(
+        Path::new(report.project.root.as_str()),
+        &app_dir,
+        &report.project,
     )?;
 
     Ok(())
@@ -298,6 +300,180 @@ fn copy_project_files(source: &Path, destination: &Path, output_dir: &Path) -> R
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct DependencyRequest {
+    name: String,
+    requested_by: Option<PathBuf>,
+    optional: bool,
+}
+
+fn copy_runtime_dependencies(
+    root: &Path,
+    app_dir: &Path,
+    snapshot: &ProjectSnapshot,
+) -> Result<()> {
+    if !has_runtime_dependencies(snapshot) {
+        return Ok(());
+    }
+
+    let root_node_modules = root.join("node_modules");
+    let app_node_modules = app_dir.join("node_modules");
+    let mut queue = VecDeque::new();
+    let mut copied_paths = BTreeSet::new();
+
+    for name in snapshot.dependencies.keys() {
+        queue.push_back(DependencyRequest {
+            name: name.clone(),
+            requested_by: None,
+            optional: false,
+        });
+    }
+
+    for name in snapshot.optional_dependencies.keys() {
+        queue.push_back(DependencyRequest {
+            name: name.clone(),
+            requested_by: None,
+            optional: true,
+        });
+    }
+
+    while let Some(request) = queue.pop_front() {
+        let Some(package_dir) = resolve_dependency_dir(
+            &root_node_modules,
+            request.requested_by.as_deref(),
+            &request.name,
+        ) else {
+            if request.optional {
+                continue;
+            }
+
+            bail!(
+                "Runtime dependency '{}' is not installed. Run your package manager install first.",
+                request.name
+            );
+        };
+
+        let canonical_package_dir = package_dir
+            .canonicalize()
+            .with_context(|| format!("Could not resolve {}", package_dir.display()))?;
+        let canonical_root_node_modules = root_node_modules
+            .canonicalize()
+            .with_context(|| format!("Could not resolve {}", root_node_modules.display()))?;
+        if !copied_paths.insert(canonical_package_dir.clone()) {
+            continue;
+        }
+
+        let relative_path = canonical_package_dir
+            .strip_prefix(&canonical_root_node_modules)
+            .with_context(|| {
+                format!(
+                    "Could not make dependency {} relative to {}",
+                    canonical_package_dir.display(),
+                    canonical_root_node_modules.display()
+                )
+            })?;
+        let destination = app_node_modules.join(relative_path);
+        copy_recursively(&canonical_package_dir, &destination).with_context(|| {
+            format!(
+                "Could not copy runtime dependency {} to {}",
+                canonical_package_dir.display(),
+                destination.display()
+            )
+        })?;
+
+        let package_json = read_dependency_package_json(&canonical_package_dir)?;
+        for name in string_map(package_json.get("dependencies")).keys() {
+            queue.push_back(DependencyRequest {
+                name: name.clone(),
+                requested_by: Some(canonical_package_dir.clone()),
+                optional: false,
+            });
+        }
+        for name in string_map(package_json.get("optionalDependencies")).keys() {
+            queue.push_back(DependencyRequest {
+                name: name.clone(),
+                requested_by: Some(canonical_package_dir.clone()),
+                optional: true,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn runtime_dependency_warnings(root: &Path, snapshot: &ProjectSnapshot) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let root_node_modules = root.join("node_modules");
+
+    for name in snapshot.dependencies.keys() {
+        if resolve_dependency_dir(&root_node_modules, None, name).is_none() {
+            warnings.push(format!(
+                "Runtime dependency is not installed and packaging will fail: {name}."
+            ));
+        }
+    }
+
+    for name in snapshot.optional_dependencies.keys() {
+        if resolve_dependency_dir(&root_node_modules, None, name).is_none() {
+            warnings.push(format!(
+                "Optional runtime dependency is not installed and will be skipped: {name}."
+            ));
+        }
+    }
+
+    warnings
+}
+
+fn resolve_dependency_dir(
+    root_node_modules: &Path,
+    requested_by: Option<&Path>,
+    name: &str,
+) -> Option<PathBuf> {
+    let relative_path = dependency_relative_path(name);
+
+    if let Some(requested_by) = requested_by {
+        let nested = requested_by.join("node_modules").join(&relative_path);
+        if nested.exists() {
+            return Some(nested);
+        }
+    }
+
+    let hoisted = root_node_modules.join(relative_path);
+    hoisted.exists().then_some(hoisted)
+}
+
+fn dependency_relative_path(name: &str) -> PathBuf {
+    let mut path = PathBuf::new();
+    for part in name.split('/') {
+        if !part.is_empty() {
+            path.push(part);
+        }
+    }
+    path
+}
+
+fn read_dependency_package_json(package_dir: &Path) -> Result<Value> {
+    let package_json_path = package_dir.join("package.json");
+    let raw = fs::read_to_string(&package_json_path)
+        .with_context(|| format!("Could not read {}", package_json_path.display()))?;
+    serde_json::from_str::<Value>(&raw)
+        .with_context(|| format!("Could not parse {}", package_json_path.display()))
+}
+
+fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
+    value
+        .and_then(Value::as_object)
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn copy_recursively(source: &Path, destination: &Path) -> Result<()> {
@@ -622,7 +798,55 @@ mod tests {
     }
 
     #[test]
-    fn refuses_runtime_dependencies_until_pruning_exists() {
+    fn packages_runtime_dependency_closure_from_node_modules() {
+        let root = unique_temp_dir("runtime-deps");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"starter-app","version":"0.1.0","main":"src/main.js","dependencies":{"dep-a":"1.0.0"},"devDependencies":{"electron":"30.0.0","dev-only":"1.0.0"}}"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+        write_dependency_package(
+            &root,
+            "dep-a",
+            r#"{"name":"dep-a","version":"1.0.0","dependencies":{"dep-b":"1.0.0"}}"#,
+        );
+        write_dependency_package(&root, "dep-b", r#"{"name":"dep-b","version":"1.0.0"}"#);
+        write_dependency_package(
+            &root,
+            "dev-only",
+            r#"{"name":"dev-only","version":"1.0.0"}"#,
+        );
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.warnings.is_empty());
+        execute_package(&report, false).expect("package should succeed");
+
+        let app_node_modules = Path::new(report.app_resources_dir.as_str())
+            .join("app")
+            .join("node_modules");
+        assert!(app_node_modules.join("dep-a/package.json").exists());
+        assert!(app_node_modules.join("dep-b/package.json").exists());
+        assert!(!app_node_modules.join("dev-only").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_required_runtime_dependency_fails() {
         let root = unique_temp_dir("runtime-deps");
         fs::write(
             root.join("package.json"),
@@ -645,10 +869,43 @@ mod tests {
         let snapshot = crate::project::inspect(&root).expect("project should inspect");
         let report = build_report(snapshot, &args).expect("report should build");
 
-        assert!(report
-            .warnings
-            .contains(&"Packaging production node_modules is not implemented yet; this project declares runtime dependencies.".to_string()));
+        assert!(report.warnings.contains(
+            &"Runtime dependency is not installed and packaging will fail: left-pad.".to_string()
+        ));
         assert!(execute_package(&report, false).is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_optional_runtime_dependency_is_skipped() {
+        let root = unique_temp_dir("optional-runtime-deps");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"starter-app","version":"0.1.0","main":"src/main.js","optionalDependencies":{"optional-native":"1.0.0"},"devDependencies":{"electron":"30.0.0"}}"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.warnings.contains(
+            &"Optional runtime dependency is not installed and will be skipped: optional-native."
+                .to_string()
+        ));
+        execute_package(&report, false).expect("optional dependency should be skipped");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -657,6 +914,10 @@ mod tests {
     fn cleans_scoped_package_names_for_bundle_paths() {
         assert_eq!(clean_app_name("@scope/app"), "scope-app");
         assert_eq!(sanitize_artifact_name("Starter App"), "starter-app");
+        assert_eq!(
+            dependency_relative_path("@scope/app"),
+            PathBuf::from("@scope/app")
+        );
     }
 
     fn write_package_json(root: &Path) {
@@ -671,6 +932,17 @@ mod tests {
         fs::create_dir_all(root.join("src")).expect("src should be created");
         fs::write(root.join("src/main.js"), "console.log('hello');")
             .expect("main file should be written");
+    }
+
+    fn write_dependency_package(root: &Path, name: &str, package_json: &str) {
+        let package_dir = root
+            .join("node_modules")
+            .join(dependency_relative_path(name));
+        fs::create_dir_all(&package_dir).expect("dependency package dir should be created");
+        fs::write(package_dir.join("package.json"), package_json)
+            .expect("dependency package.json should be written");
+        fs::write(package_dir.join("index.js"), "module.exports = true;")
+            .expect("dependency index should be written");
     }
 
     fn write_fake_electron_dist(root: &Path) {
