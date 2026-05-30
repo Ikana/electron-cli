@@ -20,5 +20,6 @@ fn run() -> Result<()> {
     match cli.command {
         Commands::Doctor(args) => commands::doctor::run(args),
         Commands::Inspect(args) => commands::inspect::run(args),
+        Commands::Plan(args) => commands::plan::run(args),
     }
 }

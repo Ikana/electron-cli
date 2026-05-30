@@ -289,4 +289,32 @@ mod tests {
         assert!(signals.contains(&"typescript tooling detected".to_string()));
         assert!(signals.contains(&"electron command found in package scripts".to_string()));
     }
+
+    #[test]
+    fn inspects_electron_forge_fixture_from_nested_directory() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/electron-forge");
+        let nested = fixture.join("src");
+
+        let snapshot = inspect(&nested).expect("fixture should inspect");
+
+        assert_eq!(snapshot.name.as_deref(), Some("fixture-electron-forge-app"));
+        assert_eq!(snapshot.version.as_deref(), Some("0.1.0"));
+        assert_eq!(snapshot.main.as_deref(), Some("src/main.ts"));
+        assert_eq!(snapshot.package_manager.as_deref(), Some("npm"));
+        assert_eq!(snapshot.electron_dependency.as_deref(), Some("^31.0.0"));
+        assert_eq!(
+            snapshot
+                .forge_dependencies
+                .get("@electron-forge/cli")
+                .map(String::as_str),
+            Some("^7.0.0")
+        );
+        assert!(snapshot.has_javascript_dependencies());
+        assert!(snapshot
+            .signals
+            .contains(&"electron forge dependency declared".to_string()));
+        assert!(snapshot
+            .signals
+            .contains(&"electron command found in package scripts".to_string()));
+    }
 }

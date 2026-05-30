@@ -13,15 +13,17 @@ Current commands:
 ```sh
 electron-cli inspect
 electron-cli doctor
+electron-cli plan
 electron-cli inspect --json
 electron-cli doctor --json
+electron-cli plan --json
 ```
 
 Planned commands:
 
 ```sh
-electron-cli init
 electron-cli dev
+electron-cli init
 electron-cli package
 electron-cli make
 ```
@@ -70,9 +72,10 @@ cargo run -- inspect --json
 ## JSON Output
 
 Both initial commands support `--json` so agents and scripts can consume project state without scraping terminal output.
+`plan` is designed around that workflow: it recommends stable commands and reports missing project conventions as structured data.
 
 ```sh
-electron-cli doctor --json
+electron-cli plan --json
 ```
 
 ## License

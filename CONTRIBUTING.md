@@ -5,9 +5,9 @@ This project is a learning-first Rust CLI for Electron workflows.
 ## Local Checks
 
 ```sh
-npm run format
 npm run lint
 npm test
+npm run build
 ```
 
 ## Project Direction

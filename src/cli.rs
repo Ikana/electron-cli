@@ -20,6 +20,8 @@ pub enum Commands {
     Doctor(CommandArgs),
     /// Print a structured snapshot of the current JavaScript/Electron project.
     Inspect(CommandArgs),
+    /// Recommend next commands and risks from the project snapshot.
+    Plan(CommandArgs),
 }
 
 #[derive(Debug, Clone, Args)]
