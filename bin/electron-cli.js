@@ -7,11 +7,14 @@ const path = require("node:path");
 const root = path.resolve(__dirname, "..");
 const exe = process.platform === "win32" ? "electron-cli.exe" : "electron-cli";
 const args = process.argv.slice(2);
+const envBinary = process.env.ELECTRON_CLI_BINARY;
 
 const candidates = [
+  envBinary,
+  path.join(root, "bin", "downloaded", exe),
   path.join(root, "target", "release", exe),
   path.join(root, "target", "debug", exe),
-];
+].filter(Boolean);
 
 const binary = candidates.find((candidate) => fs.existsSync(candidate));
 
@@ -28,8 +31,8 @@ if (!fs.existsSync(manifest)) {
   process.exit(1);
 }
 
-console.error("electron-cli is experimental and needs Rust to run from npm source packages.");
-console.error("Building/running through cargo; install Rust from https://rustup.rs if this fails.");
+console.error("electron-cli could not find a prebuilt binary for this install.");
+console.error("Building/running through Cargo fallback; install Rust from https://rustup.rs if this fails.");
 
 exitWith(
   spawnSync(cargo, ["run", "--quiet", "--manifest-path", manifest, "--", ...args], {

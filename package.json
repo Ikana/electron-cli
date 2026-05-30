@@ -1,21 +1,22 @@
 {
   "name": "electron-cli",
-  "version": "0.3.0-alpha.0",
+  "version": "0.3.0-alpha.1",
   "description": "Experimental Rust CLI for Electron project diagnostics and workflow automation",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/roderik/electron-cli.git"
+    "url": "git+https://github.com/Ikana/electron-cli.git"
   },
-  "homepage": "https://github.com/roderik/electron-cli#readme",
+  "homepage": "https://github.com/Ikana/electron-cli#readme",
   "bugs": {
-    "url": "https://github.com/roderik/electron-cli/issues"
+    "url": "https://github.com/Ikana/electron-cli/issues"
   },
   "bin": {
     "electron-cli": "bin/electron-cli.js"
   },
   "files": [
     "bin",
+    "scripts",
     "src",
     "tests",
     "Cargo.toml",
@@ -30,6 +31,7 @@
     "format": "cargo fmt",
     "lint": "cargo fmt --check && cargo clippy --all-targets -- -D warnings",
     "test": "cargo test",
+    "postinstall": "node scripts/install.js",
     "prepack": "cargo build --release"
   },
   "engines": {

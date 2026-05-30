@@ -1,6 +1,8 @@
 /target
 /node_modules
 /dist
+/bin/downloaded
+electron-cli-*.tgz
 /.DS_Store
 *.log
 npm-debug.log*

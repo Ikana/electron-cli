@@ -1,10 +1,10 @@
 [package]
 name = "electron-cli"
-version = "0.3.0-alpha.0"
+version = "0.3.0-alpha.1"
 edition = "2021"
 description = "Experimental Rust CLI for Electron project diagnostics and workflow automation"
 license = "MIT"
-repository = "https://github.com/roderik/electron-cli"
+repository = "https://github.com/Ikana/electron-cli"
 
 [dependencies]
 anyhow = "1.0"

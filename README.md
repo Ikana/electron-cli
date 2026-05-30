@@ -32,11 +32,17 @@ The planned workflow commands may start by wrapping Electron Forge or other esta
 
 ## Install
 
-During the experimental phase, the npm package runs from Rust source when a prebuilt binary is not available. You need Node.js and Rust installed.
+During the experimental phase, the npm package downloads a prebuilt binary from GitHub Releases when one is available. If a prebuilt binary is not available for your platform, it falls back to running from Rust source.
 
 ```sh
 npm install -g electron-cli
 electron-cli doctor
+```
+
+To skip binary download and use the Cargo fallback:
+
+```sh
+ELECTRON_CLI_SKIP_DOWNLOAD=1 npm install -g electron-cli@alpha
 ```
 
 For local development:
