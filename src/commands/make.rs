@@ -325,13 +325,17 @@ mod tests {
         let report = build_report(&args).expect("report should build");
 
         assert_eq!(report.target, "zip");
-        assert!(report.artifact.as_str().ends_with(&format!(
-            "out/make/zip/{}/{}/starter-app-{}-{}.zip",
-            report.package.platform(),
-            report.package.arch(),
-            report.package.platform(),
-            report.package.arch()
-        )));
+        let expected_suffix = PathBuf::from("out")
+            .join("make")
+            .join("zip")
+            .join(report.package.platform())
+            .join(report.package.arch())
+            .join(format!(
+                "starter-app-{}-{}.zip",
+                report.package.platform(),
+                report.package.arch()
+            ));
+        assert!(Path::new(report.artifact.as_str()).ends_with(expected_suffix));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -361,14 +365,18 @@ mod tests {
 
         let file = File::open(report.artifact.as_str()).expect("artifact should exist");
         let mut archive = ZipArchive::new(file).expect("zip should open");
-        let app_entry = if cfg!(target_os = "macos") {
-            "starter-app.app/Contents/Resources/app/package.json"
+        let app_entry = if report.package.platform() == "darwin" {
+            "starter-app.app/Contents/Resources/app/package.json".to_string()
         } else {
-            "starter-app/resources/app/package.json"
+            format!(
+                "starter-app-{}-{}/resources/app/package.json",
+                report.package.platform(),
+                report.package.arch()
+            )
         };
 
         archive
-            .by_name(app_entry)
+            .by_name(&app_entry)
             .expect("app package.json should be archived");
 
         let _ = fs::remove_dir_all(root);
