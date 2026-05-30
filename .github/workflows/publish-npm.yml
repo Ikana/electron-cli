@@ -1,0 +1,54 @@
+name: Publish npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version to publish, for example 0.3.0-alpha.1"
+        required: true
+      dist_tag:
+        description: "npm dist-tag to apply"
+        required: true
+        default: "alpha"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish ${{ inputs.version }} to npm
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Use npm with trusted publishing support
+        run: npm install -g npm@^11.10.0
+
+      - name: Verify package version
+        shell: bash
+        run: |
+          actual="$(node -p "require('./package.json').version")"
+          if [ "$actual" != "${{ inputs.version }}" ]; then
+            echo "package.json version is $actual, expected ${{ inputs.version }}"
+            exit 1
+          fi
+
+      - name: Verify GitHub release assets exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "v${{ inputs.version }}" --repo "$GITHUB_REPOSITORY"
+
+      - name: Publish to npm
+        run: npm publish --tag "${{ inputs.dist_tag }}" --provenance
