@@ -15,7 +15,7 @@
     "electron-cli": "bin/electron-cli.js"
   },
   "files": [
-    "bin",
+    "bin/electron-cli.js",
     "scripts",
     "src",
     "tests",
