@@ -32,6 +32,7 @@ pub(crate) struct PackageReport {
     app_name: String,
     executable_name: String,
     metadata: PackageMetadata,
+    prune: bool,
     asar: AsarPlan,
     signing: PackageSigningPlan,
     platform: String,
@@ -182,6 +183,7 @@ struct PackagerConfig {
     icon: Vec<String>,
     extra_resource: Vec<String>,
     ignore: Vec<String>,
+    prune: Option<bool>,
     asar: AsarConfig,
     darwin_dark_mode_support: bool,
     osx_sign: MacosSignConfig,
@@ -291,6 +293,7 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         &app_resources_dir,
         &platform,
     )?;
+    let prune = package_config.packager.prune.unwrap_or(true);
     let (asar, asar_warnings) = package_asar(&app_resources_dir, &package_config)?;
     let (signing, signing_warnings) = package_signing(root, &package_config, &platform)?;
 
@@ -339,11 +342,20 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         (electron_source, bundle_dir.clone()),
         (root.to_path_buf(), app_resources_dir.join("app")),
     ];
-    if has_runtime_dependencies(&snapshot) {
+    let should_plan_node_modules_copy = if prune {
+        has_runtime_dependencies(&snapshot)
+    } else {
+        root.join("node_modules").exists()
+    };
+    if should_plan_node_modules_copy {
         copy_steps.push((
             root.join("node_modules"),
             app_resources_dir.join("app/node_modules"),
         ));
+    } else if !prune && snapshot.has_javascript_dependencies() {
+        warnings.push(
+            "packagerConfig.prune is false, but node_modules was not found; installed dependencies will not be bundled.".to_string(),
+        );
     }
     if let Some(icon) = &metadata.icon {
         copy_steps.push((
@@ -363,6 +375,7 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         app_name,
         executable_name,
         metadata,
+        prune,
         asar,
         signing,
         platform,
@@ -463,12 +476,21 @@ pub(crate) fn execute_package(report: &PackageReport, force: bool) -> Result<()>
         Path::new(report.project.root.as_str()),
         &ignore_rules,
     )?;
-    copy_runtime_dependencies(
-        Path::new(report.project.root.as_str()),
-        &app_dir,
-        &report.project,
-        &ignore_rules,
-    )?;
+    if report.prune {
+        copy_runtime_dependencies(
+            Path::new(report.project.root.as_str()),
+            &app_dir,
+            &report.project,
+            &ignore_rules,
+        )?;
+    } else {
+        copy_all_node_modules(
+            Path::new(report.project.root.as_str()),
+            &app_dir,
+            Path::new(report.output_dir.as_str()),
+            &ignore_rules,
+        )?;
+    }
     execute_asar_packaging(report)?;
     execute_macos_signing(report)?;
     execute_macos_notarization(report)?;
@@ -757,6 +779,10 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
     if let Some(version) = &report.metadata.app_version {
         println!("  app version: {version}");
     }
+    println!(
+        "  dependency pruning: {}",
+        if report.prune { "enabled" } else { "disabled" }
+    );
     println!("  target: {} {}", report.platform, report.arch);
     println!("  status: {}", report.status.as_str());
 
@@ -941,6 +967,7 @@ fn parse_packager_config(value: &JsonValue) -> PackagerConfig {
         icon: string_list(value.get("icon")),
         extra_resource: string_list(value.get("extraResource")),
         ignore: string_list(value.get("ignore")),
+        prune: value.get("prune").and_then(JsonValue::as_bool),
         asar: parse_asar_config(value.get("asar")),
         darwin_dark_mode_support: value
             .get("darwinDarkModeSupport")
@@ -1894,7 +1921,11 @@ fn copy_runtime_dependencies(
     let mut queue = VecDeque::new();
     let mut copied_paths = BTreeSet::new();
 
-    for name in snapshot.dependencies.keys() {
+    for name in snapshot
+        .dependencies
+        .keys()
+        .filter(|name| !is_electron_runtime_package(name))
+    {
         queue.push_back(DependencyRequest {
             name: name.clone(),
             requested_by: None,
@@ -1902,7 +1933,11 @@ fn copy_runtime_dependencies(
         });
     }
 
-    for name in snapshot.optional_dependencies.keys() {
+    for name in snapshot
+        .optional_dependencies
+        .keys()
+        .filter(|name| !is_electron_runtime_package(name))
+    {
         queue.push_back(DependencyRequest {
             name: name.clone(),
             requested_by: None,
@@ -1973,6 +2008,88 @@ fn copy_runtime_dependencies(
                 optional: true,
             });
         }
+    }
+
+    Ok(())
+}
+
+fn copy_all_node_modules(
+    root: &Path,
+    app_dir: &Path,
+    output_dir: &Path,
+    ignore_rules: &[IgnoreRule],
+) -> Result<()> {
+    let root_node_modules = root.join("node_modules");
+    if !root_node_modules.exists() {
+        return Ok(());
+    }
+
+    let app_node_modules = app_dir.join("node_modules");
+    fs::create_dir_all(&app_node_modules)
+        .with_context(|| format!("Could not create {}", app_node_modules.display()))?;
+
+    for entry in fs::read_dir(&root_node_modules)
+        .with_context(|| format!("Could not read {}", root_node_modules.display()))?
+    {
+        let entry = entry?;
+        copy_node_modules_entry_prune_disabled(
+            &entry.path(),
+            &app_node_modules.join(entry.file_name()),
+            root,
+            output_dir,
+            ignore_rules,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn copy_node_modules_entry_prune_disabled(
+    source: &Path,
+    destination: &Path,
+    project_root: &Path,
+    output_dir: &Path,
+    ignore_rules: &[IgnoreRule],
+) -> Result<()> {
+    let file_name = source
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .unwrap_or_default();
+
+    if should_skip_prune_disabled_node_modules_entry(source, file_name, project_root, output_dir)
+        || should_ignore_path(source, project_root, ignore_rules)
+    {
+        return Ok(());
+    }
+
+    if source.is_dir() {
+        fs::create_dir_all(destination)
+            .with_context(|| format!("Could not create {}", destination.display()))?;
+
+        for entry in
+            fs::read_dir(source).with_context(|| format!("Could not read {}", source.display()))?
+        {
+            let entry = entry?;
+            copy_node_modules_entry_prune_disabled(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                project_root,
+                output_dir,
+                ignore_rules,
+            )?;
+        }
+    } else {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Could not create {}", parent.display()))?;
+        }
+        fs::copy(source, destination).with_context(|| {
+            format!(
+                "Could not copy {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
     }
 
     Ok(())
@@ -2632,7 +2749,11 @@ fn runtime_dependency_warnings(root: &Path, snapshot: &ProjectSnapshot) -> Vec<S
     let mut warnings = Vec::new();
     let root_node_modules = root.join("node_modules");
 
-    for name in snapshot.dependencies.keys() {
+    for name in snapshot
+        .dependencies
+        .keys()
+        .filter(|name| !is_electron_runtime_package(name))
+    {
         if resolve_dependency_dir(&root_node_modules, None, name).is_none() {
             warnings.push(format!(
                 "Runtime dependency is not installed and packaging will fail: {name}."
@@ -2640,7 +2761,11 @@ fn runtime_dependency_warnings(root: &Path, snapshot: &ProjectSnapshot) -> Vec<S
         }
     }
 
-    for name in snapshot.optional_dependencies.keys() {
+    for name in snapshot
+        .optional_dependencies
+        .keys()
+        .filter(|name| !is_electron_runtime_package(name))
+    {
         if resolve_dependency_dir(&root_node_modules, None, name).is_none() {
             warnings.push(format!(
                 "Optional runtime dependency is not installed and will be skipped: {name}."
@@ -2737,6 +2862,16 @@ fn copy_recursively_with_ignore(
     project_root: &Path,
     ignore_rules: &[IgnoreRule],
 ) -> Result<()> {
+    let file_name = source
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .unwrap_or_default();
+    if is_default_ignored_copy_entry(file_name)
+        || is_default_ignored_node_modules_path(source, project_root)
+    {
+        return Ok(());
+    }
+
     if should_ignore_path(source, project_root, ignore_rules) {
         return Ok(());
     }
@@ -2818,11 +2953,53 @@ fn path_to_forward_slashes(path: &Path) -> String {
 }
 
 fn should_skip_project_entry(source_path: &Path, file_name: &str, output_dir: &Path) -> bool {
-    if matches!(file_name, ".git" | "node_modules" | "target") {
+    if matches!(file_name, ".git" | "node_modules" | "target")
+        || is_default_ignored_copy_entry(file_name)
+    {
         return true;
     }
 
     same_path_or_inside(source_path, output_dir)
+}
+
+fn should_skip_prune_disabled_node_modules_entry(
+    source_path: &Path,
+    file_name: &str,
+    project_root: &Path,
+    output_dir: &Path,
+) -> bool {
+    is_default_ignored_copy_entry(file_name)
+        || same_path_or_inside(source_path, output_dir)
+        || is_default_ignored_node_modules_path(source_path, project_root)
+}
+
+fn is_default_ignored_copy_entry(file_name: &str) -> bool {
+    matches!(
+        file_name,
+        ".git" | "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" | "node_gyp_bins"
+    ) || file_name.ends_with(".o")
+        || file_name.ends_with(".obj")
+}
+
+fn is_default_ignored_node_modules_path(path: &Path, project_root: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(project_root) else {
+        return false;
+    };
+
+    let mut previous_was_node_modules = false;
+    for component in relative.components() {
+        let std::path::Component::Normal(value) = component else {
+            previous_was_node_modules = false;
+            continue;
+        };
+        let value = value.to_string_lossy();
+        if previous_was_node_modules && value == ".bin" {
+            return true;
+        }
+        previous_was_node_modules = value == "node_modules";
+    }
+
+    false
 }
 
 fn same_path_or_inside(path: &Path, parent: &Path) -> bool {
@@ -2958,7 +3135,15 @@ fn sanitize_artifact_name(name: &str) -> String {
 }
 
 fn has_runtime_dependencies(snapshot: &ProjectSnapshot) -> bool {
-    !snapshot.dependencies.is_empty() || !snapshot.optional_dependencies.is_empty()
+    snapshot
+        .dependencies
+        .keys()
+        .chain(snapshot.optional_dependencies.keys())
+        .any(|name| !is_electron_runtime_package(name))
+}
+
+fn is_electron_runtime_package(name: &str) -> bool {
+    matches!(name, "electron" | "electron-nightly")
 }
 
 fn current_platform() -> String {
@@ -3019,6 +3204,7 @@ impl PackagerConfig {
         if !other.ignore.is_empty() {
             self.ignore = other.ignore;
         }
+        self.prune = other.prune.or(self.prune);
         if other.asar.configured {
             self.asar = other.asar;
         }
@@ -3112,6 +3298,8 @@ mod tests {
         write_package_json(&root);
         write_app_file(&root);
         write_fake_electron_dist(&root);
+        fs::write(root.join("package-lock.json"), "{}").expect("lockfile should be written");
+        fs::write(root.join("build.o"), "object").expect("object file should be written");
         fs::create_dir_all(root.join("node_modules/ignored"))
             .expect("node_modules should be created");
         fs::write(root.join("node_modules/ignored/file.js"), "")
@@ -3135,6 +3323,8 @@ mod tests {
         let app_dir = Path::new(report.app_resources_dir.as_str()).join("app");
         assert!(app_dir.join("package.json").exists());
         assert!(app_dir.join("src/main.js").exists());
+        assert!(!app_dir.join("package-lock.json").exists());
+        assert!(!app_dir.join("build.o").exists());
         assert!(!app_dir.join("node_modules").exists());
 
         if current_platform() == "darwin" {
@@ -3171,6 +3361,8 @@ mod tests {
             "dev-only",
             r#"{"name":"dev-only","version":"1.0.0"}"#,
         );
+        fs::write(root.join("node_modules/dep-a/package-lock.json"), "{}")
+            .expect("dependency lockfile should be written");
 
         let args = PackageArgs {
             cwd: root.clone(),
@@ -3185,6 +3377,7 @@ mod tests {
         let snapshot = crate::project::inspect(&root).expect("project should inspect");
         let report = build_report(snapshot, &args).expect("report should build");
 
+        assert!(report.prune);
         assert!(report.warnings.is_empty());
         execute_package(&report, false).expect("package should succeed");
 
@@ -3193,7 +3386,105 @@ mod tests {
             .join("node_modules");
         assert!(app_node_modules.join("dep-a/package.json").exists());
         assert!(app_node_modules.join("dep-b/package.json").exists());
+        assert!(!app_node_modules.join("dep-a/package-lock.json").exists());
         assert!(!app_node_modules.join("dev-only").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn packages_all_node_modules_when_prune_is_disabled() {
+        let root = unique_temp_dir("prune-disabled");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name":"starter-app",
+                "version":"0.1.0",
+                "main":"src/main.js",
+                "dependencies":{"dep-a":"1.0.0"},
+                "devDependencies":{"electron":"30.0.0","dev-only":"1.0.0"},
+                "config":{"forge":{"packagerConfig":{"prune":false}}}
+            }"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+        write_dependency_package(&root, "dep-a", r#"{"name":"dep-a","version":"1.0.0"}"#);
+        write_dependency_package(
+            &root,
+            "dev-only",
+            r#"{"name":"dev-only","version":"1.0.0"}"#,
+        );
+        fs::write(root.join("package-lock.json"), "{}").expect("lockfile should be written");
+        fs::write(root.join("node_modules/dep-a/package-lock.json"), "{}")
+            .expect("dependency lockfile should be written");
+        fs::create_dir_all(root.join("node_modules/.bin")).expect(".bin should be created");
+        fs::write(root.join("node_modules/.bin/dev-only"), "")
+            .expect(".bin shim should be written");
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(!report.prune);
+        assert!(report.warnings.is_empty());
+        execute_package(&report, false).expect("package should succeed");
+
+        let app_node_modules = Path::new(report.app_resources_dir.as_str())
+            .join("app")
+            .join("node_modules");
+        assert!(app_node_modules.join("dep-a/package.json").exists());
+        assert!(app_node_modules.join("dev-only/package.json").exists());
+        assert!(!app_node_modules.join("dep-a/package-lock.json").exists());
+        assert!(!app_node_modules.join(".bin").exists());
+        assert!(app_node_modules.join("electron/dist").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skips_electron_runtime_package_when_pruning_enabled() {
+        let root = unique_temp_dir("skip-electron-runtime-package");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"starter-app","version":"0.1.0","main":"src/main.js","dependencies":{"dep-a":"1.0.0","electron":"30.0.0"}}"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+        write_dependency_package(&root, "dep-a", r#"{"name":"dep-a","version":"1.0.0"}"#);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.prune);
+        assert!(report.warnings.is_empty());
+        execute_package(&report, false).expect("package should succeed");
+
+        let app_node_modules = Path::new(report.app_resources_dir.as_str())
+            .join("app")
+            .join("node_modules");
+        assert!(app_node_modules.join("dep-a/package.json").exists());
+        assert!(!app_node_modules.join("electron").exists());
 
         let _ = fs::remove_dir_all(root);
     }
