@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     fs::File,
-    io::{self, BufWriter, Write},
+    io::{self, BufWriter, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -20,11 +20,15 @@ use plist::{Dictionary as PlistDictionary, Value as PlistValue};
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 
 use crate::{cli::PackageArgs, output, project::ProjectSnapshot};
 
 const APPLE_TIMESTAMP_URL: &str = "http://timestamp.apple.com/ts01";
 const MACOS_NOTARIZATION_WAIT_TIMEOUT_SECONDS: u64 = 600;
+const ASAR_INTEGRITY_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+const WINDOWS_ASAR_INTEGRITY_TYPE: &str = "INTEGRITY";
+const WINDOWS_ASAR_INTEGRITY_ID: &str = "ELECTRONASAR";
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct PackageReport {
@@ -619,6 +623,7 @@ pub(crate) fn execute_package(report: &PackageReport, force: bool) -> Result<()>
         )?;
     }
     execute_asar_packaging(report)?;
+    apply_packaged_asar_integrity(report)?;
     execute_macos_signing(report)?;
     execute_macos_notarization(report)?;
 
@@ -2696,6 +2701,29 @@ struct AsarFileHeader {
     unpacked: bool,
     #[serde(skip_serializing_if = "is_false")]
     executable: bool,
+    integrity: AsarFileIntegrity,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AsarFileIntegrity {
+    algorithm: &'static str,
+    hash: String,
+    #[serde(rename = "blockSize")]
+    block_size: usize,
+    blocks: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AsarPackagedIntegrity {
+    algorithm: &'static str,
+    hash: String,
+}
+
+#[derive(Serialize)]
+struct WindowsAsarIntegrityEntry<'a> {
+    file: &'a str,
+    alg: &'a str,
+    value: &'a str,
 }
 
 enum AsarEntryKind {
@@ -3062,6 +3090,12 @@ fn write_asar_archive(
                 executable,
                 unpacked,
             } => {
+                let integrity = asar_file_integrity(&entry.source).with_context(|| {
+                    format!(
+                        "Could not calculate ASAR integrity for {}",
+                        entry.source.display()
+                    )
+                })?;
                 insert_asar_header_entry(
                     &mut header,
                     &entry.relative,
@@ -3070,6 +3104,7 @@ fn write_asar_archive(
                         offset: (!*unpacked).then(|| offset.to_string()),
                         unpacked: *unpacked,
                         executable: *executable,
+                        integrity,
                     }),
                 )?;
                 if !unpacked {
@@ -3142,6 +3177,95 @@ fn write_asar_archive(
     }
 
     writer.flush().context("Could not flush ASAR archive")
+}
+
+fn asar_file_integrity(path: &Path) -> Result<AsarFileIntegrity> {
+    let mut file =
+        File::open(path).with_context(|| format!("Could not open {}", path.display()))?;
+    let mut file_hasher = Sha256::new();
+    let mut block_hasher = Sha256::new();
+    let mut block_size = 0_usize;
+    let mut blocks = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("Could not read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+
+        file_hasher.update(&buffer[..read]);
+        let mut offset = 0;
+        while offset < read {
+            let remaining = ASAR_INTEGRITY_BLOCK_SIZE - block_size;
+            let end = (offset + remaining).min(read);
+            block_hasher.update(&buffer[offset..end]);
+            block_size += end - offset;
+            if block_size == ASAR_INTEGRITY_BLOCK_SIZE {
+                blocks.push(hex::encode(block_hasher.finalize()));
+                block_hasher = Sha256::new();
+                block_size = 0;
+            }
+            offset = end;
+        }
+    }
+
+    if block_size > 0 || blocks.is_empty() {
+        blocks.push(hex::encode(block_hasher.finalize()));
+    }
+
+    Ok(AsarFileIntegrity {
+        algorithm: "SHA256",
+        hash: hex::encode(file_hasher.finalize()),
+        block_size: ASAR_INTEGRITY_BLOCK_SIZE,
+        blocks,
+    })
+}
+
+fn asar_header_integrity(path: &Path) -> Result<AsarPackagedIntegrity> {
+    let header = read_asar_header_string(path)?;
+    Ok(AsarPackagedIntegrity {
+        algorithm: "SHA256",
+        hash: sha256_hex(header.as_bytes()),
+    })
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
+fn read_asar_header_string(path: &Path) -> Result<String> {
+    let archive = fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
+    if archive.len() < 16 {
+        bail!("ASAR archive header is truncated: {}", path.display());
+    }
+
+    let header_size = u32::from_le_bytes(
+        archive[4..8]
+            .try_into()
+            .expect("header size slice should have four bytes"),
+    ) as usize;
+    let header_end = 8 + header_size;
+    if archive.len() < header_end || header_size < 8 {
+        bail!("ASAR archive header is invalid: {}", path.display());
+    }
+
+    let header = &archive[8..header_end];
+    let string_size = u32::from_le_bytes(
+        header[4..8]
+            .try_into()
+            .expect("header string size slice should have four bytes"),
+    ) as usize;
+    if string_size > header.len().saturating_sub(8) {
+        bail!("ASAR archive header string is invalid: {}", path.display());
+    }
+
+    String::from_utf8(header[8..8 + string_size].to_vec())
+        .with_context(|| format!("ASAR archive header is not UTF-8: {}", path.display()))
 }
 
 fn copy_unpacked_asar_file(source: &Path, unpacked_dir: &Path, relative: &Path) -> Result<()> {
@@ -3298,6 +3422,33 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
     false
 }
 
+fn apply_packaged_asar_integrity(report: &PackageReport) -> Result<()> {
+    if !report.asar.enabled {
+        return Ok(());
+    }
+
+    let archive = report
+        .asar
+        .archive
+        .as_ref()
+        .context("ASAR packaging is enabled without an archive path")?;
+    let archive = Path::new(archive.as_str());
+    let integrity = asar_header_integrity(archive).with_context(|| {
+        format!(
+            "Could not calculate ASAR header integrity for {}",
+            archive.display()
+        )
+    })?;
+
+    if report.platform == "darwin" {
+        apply_macos_asar_integrity(report, &integrity)?;
+    } else if report.platform == "win32" {
+        apply_windows_asar_integrity(report, &integrity)?;
+    }
+
+    Ok(())
+}
+
 fn apply_package_metadata(report: &PackageReport) -> Result<()> {
     if report.platform == "darwin" {
         apply_macos_metadata(report)?;
@@ -3331,6 +3482,149 @@ fn apply_windows_metadata(report: &PackageReport) -> Result<()> {
     };
 
     apply_windows_executable_resources(executable, icon, version, manifest)
+}
+
+fn apply_macos_asar_integrity(
+    report: &PackageReport,
+    integrity: &AsarPackagedIntegrity,
+) -> Result<()> {
+    let info_plist = Path::new(report.bundle_dir.as_str()).join("Contents/Info.plist");
+    let mut dictionary = read_plist_dictionary(&info_plist)?;
+    let mut archive_integrity = PlistDictionary::new();
+    archive_integrity.insert(
+        "algorithm".to_string(),
+        PlistValue::String(integrity.algorithm.to_string()),
+    );
+    archive_integrity.insert(
+        "hash".to_string(),
+        PlistValue::String(integrity.hash.clone()),
+    );
+
+    let mut integrity_root = PlistDictionary::new();
+    integrity_root.insert(
+        macos_asar_integrity_path(report),
+        PlistValue::Dictionary(archive_integrity),
+    );
+    dictionary.insert(
+        "ElectronAsarIntegrity".to_string(),
+        PlistValue::Dictionary(integrity_root),
+    );
+    write_plist_dictionary(&info_plist, dictionary)
+}
+
+fn macos_asar_integrity_path(report: &PackageReport) -> String {
+    let archive = report
+        .asar
+        .archive
+        .as_ref()
+        .map(|path| PathBuf::from(path.as_str()))
+        .unwrap_or_else(|| Path::new(report.app_resources_dir.as_str()).join("app.asar"));
+    let contents = Path::new(report.bundle_dir.as_str()).join("Contents");
+    archive
+        .strip_prefix(&contents)
+        .map(path_to_forward_slashes)
+        .unwrap_or_else(|_| "Resources/app.asar".to_string())
+}
+
+fn apply_windows_asar_integrity(
+    report: &PackageReport,
+    integrity: &AsarPackagedIntegrity,
+) -> Result<()> {
+    let executable = Path::new(report.bundle_dir.as_str()).join(&report.executable_name);
+    let file = windows_asar_integrity_path(report);
+    apply_windows_asar_integrity_resource(&executable, &file, integrity)
+}
+
+fn windows_asar_integrity_path(report: &PackageReport) -> String {
+    let archive = report
+        .asar
+        .archive
+        .as_ref()
+        .map(|path| PathBuf::from(path.as_str()))
+        .unwrap_or_else(|| Path::new(report.app_resources_dir.as_str()).join("app.asar"));
+    archive
+        .strip_prefix(Path::new(report.bundle_dir.as_str()))
+        .map(|path| path.to_string_lossy().replace('/', "\\"))
+        .unwrap_or_else(|_| "resources\\app.asar".to_string())
+}
+
+fn apply_windows_asar_integrity_resource(
+    executable: &Path,
+    file: &str,
+    integrity: &AsarPackagedIntegrity,
+) -> Result<()> {
+    let mut image = editpe::Image::parse_file(executable).with_context(|| {
+        format!(
+            "Could not parse Windows executable for ASAR integrity resource editing: {}",
+            executable.display()
+        )
+    })?;
+    let mut resources = image.resource_directory().cloned().unwrap_or_default();
+    set_windows_asar_integrity_resource(&mut resources, file, integrity)?;
+    image
+        .set_resource_directory(resources)
+        .context("Could not update Windows executable ASAR integrity resource")?;
+    image.write_file(executable).with_context(|| {
+        format!(
+            "Could not write Windows executable with ASAR integrity resource: {}",
+            executable.display()
+        )
+    })
+}
+
+fn set_windows_asar_integrity_resource(
+    resources: &mut editpe::ResourceDirectory,
+    file: &str,
+    integrity: &AsarPackagedIntegrity,
+) -> Result<()> {
+    let entries = [WindowsAsarIntegrityEntry {
+        file,
+        alg: integrity.algorithm,
+        value: &integrity.hash,
+    }];
+    let payload = serde_json::to_vec(&entries)
+        .context("Could not serialize Windows ASAR integrity resource")?;
+
+    let integrity_table = ensure_windows_resource_table(
+        resources.root_mut(),
+        editpe::ResourceEntryName::from_string(WINDOWS_ASAR_INTEGRITY_TYPE),
+    )?;
+    let asar_table = ensure_windows_resource_table(
+        integrity_table,
+        editpe::ResourceEntryName::from_string(WINDOWS_ASAR_INTEGRITY_ID),
+    )?;
+    let mut data = editpe::ResourceData::default();
+    data.set_data(payload);
+    data.set_codepage(editpe::constants::CODE_PAGE_ID_EN_US as u32);
+    asar_table.insert_at(
+        editpe::ResourceEntryName::ID(editpe::constants::LANGUAGE_ID_EN_US as u32),
+        editpe::ResourceEntry::Data(data),
+        0,
+    );
+
+    Ok(())
+}
+
+fn ensure_windows_resource_table(
+    table: &mut editpe::ResourceTable,
+    name: editpe::ResourceEntryName,
+) -> Result<&mut editpe::ResourceTable> {
+    if table.get(&name).is_none() {
+        table.insert(
+            name.clone(),
+            editpe::ResourceEntry::Table(editpe::ResourceTable::default()),
+        );
+    }
+
+    match table
+        .get_mut(&name)
+        .expect("Windows resource table should exist")
+    {
+        editpe::ResourceEntry::Table(table) => Ok(table),
+        editpe::ResourceEntry::Data(_) => {
+            bail!("Windows ASAR integrity resource table conflicts with existing data")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4969,6 +5263,35 @@ mod tests {
         assert!(!app_dir.exists());
         assert!(app_asar.exists());
 
+        let header = read_asar_header_json(&app_asar);
+        let package_integrity =
+            asar_header_file_integrity(&header, &["package.json"]).expect("integrity should exist");
+        let package_json = fs::read(root.join("package.json")).expect("package.json should read");
+        assert_eq!(
+            package_integrity
+                .get("algorithm")
+                .and_then(JsonValue::as_str),
+            Some("SHA256")
+        );
+        assert_eq!(
+            package_integrity.get("hash").and_then(JsonValue::as_str),
+            Some(sha256_hex(&package_json).as_str())
+        );
+        assert_eq!(
+            package_integrity
+                .get("blockSize")
+                .and_then(JsonValue::as_u64),
+            Some(ASAR_INTEGRITY_BLOCK_SIZE as u64)
+        );
+        assert_eq!(
+            package_integrity
+                .get("blocks")
+                .and_then(JsonValue::as_array)
+                .and_then(|blocks| blocks.first())
+                .and_then(JsonValue::as_str),
+            Some(sha256_hex(&package_json).as_str())
+        );
+
         let archive = fs::read(&app_asar).expect("ASAR archive should read");
         let reader = asar::AsarReader::new(&archive, None).expect("ASAR archive should parse");
         assert!(reader.read(Path::new("package.json")).is_some());
@@ -5036,6 +5359,25 @@ mod tests {
         assert!(unpacked_node.exists());
         assert!(unpacked_asset.exists());
         assert!(!unpacked_dir.join("package.json").exists());
+
+        let header = read_asar_header_json(&app_asar);
+        let native_file = asar_header_file(
+            &header,
+            &["node_modules", "dep-a", "build", "Release", "addon.node"],
+        )
+        .expect("native file header should exist");
+        assert_eq!(
+            native_file.get("unpacked").and_then(JsonValue::as_bool),
+            Some(true)
+        );
+        assert!(native_file.get("offset").is_none());
+        let native_integrity = native_file
+            .get("integrity")
+            .expect("unpacked file integrity should exist");
+        assert_eq!(
+            native_integrity.get("hash").and_then(JsonValue::as_str),
+            Some(sha256_hex(b"native-addon").as_str())
+        );
 
         let archive = fs::read(&app_asar).expect("ASAR archive should read");
         let reader =
@@ -5609,6 +5951,98 @@ mod tests {
             .expect("manifest should exist");
         assert!(manifest.contains(r#"requestedExecutionLevel level="highestAvailable""#));
         assert!(!manifest.contains(r#"requestedExecutionLevel level="asInvoker""#));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn embeds_windows_asar_integrity_resource_into_portable_executable() {
+        let root = unique_temp_dir("windows-asar-integrity");
+        let executable = root.join("starter.exe");
+        write_minimal_pe_executable(&executable);
+        let integrity = AsarPackagedIntegrity {
+            algorithm: "SHA256",
+            hash: "9d1f61ea03c4bb62b4416387a521101b81151da0cfbe18c9f8c8b818c5cebfac".to_string(),
+        };
+
+        apply_windows_asar_integrity_resource(&executable, "resources\\app.asar", &integrity)
+            .expect("ASAR integrity resource should be embedded");
+
+        let image = editpe::Image::parse_file(&executable).expect("executable should parse");
+        let resources = image
+            .resource_directory()
+            .expect("resource directory should exist");
+        let payload =
+            windows_asar_integrity_payload(resources).expect("integrity payload should exist");
+        let parsed: JsonValue =
+            serde_json::from_slice(payload).expect("integrity payload should parse");
+        let entry = parsed
+            .as_array()
+            .and_then(|entries| entries.first())
+            .expect("integrity entry should exist");
+        assert_eq!(
+            entry.get("file").and_then(JsonValue::as_str),
+            Some("resources\\app.asar")
+        );
+        assert_eq!(entry.get("alg").and_then(JsonValue::as_str), Some("SHA256"));
+        assert_eq!(
+            entry.get("value").and_then(JsonValue::as_str),
+            Some(integrity.hash.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn writes_macos_asar_integrity_to_info_plist() {
+        let root = unique_temp_dir("macos-asar-integrity");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"starter-app","version":"0.1.0","main":"src/main.js","devDependencies":{"electron":"30.0.0"},"electronCli":{"packagerConfig":{"asar":true}}}"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_macos_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("darwin".to_string()),
+            arch: None,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+        let info_plist = Path::new(report.bundle_dir.as_str()).join("Contents/Info.plist");
+        write_plist_dictionary(&info_plist, PlistDictionary::new())
+            .expect("Info.plist should be written");
+        let integrity = AsarPackagedIntegrity {
+            algorithm: "SHA256",
+            hash: "9d1f61ea03c4bb62b4416387a521101b81151da0cfbe18c9f8c8b818c5cebfac".to_string(),
+        };
+
+        apply_macos_asar_integrity(&report, &integrity).expect("ASAR integrity should be written");
+
+        let plist = read_info_plist(&report);
+        let asar_integrity = plist
+            .get("ElectronAsarIntegrity")
+            .and_then(PlistValue::as_dictionary)
+            .and_then(|entries| entries.get("Resources/app.asar"))
+            .and_then(PlistValue::as_dictionary)
+            .expect("ASAR integrity dictionary should exist");
+        assert_eq!(
+            asar_integrity
+                .get("algorithm")
+                .and_then(PlistValue::as_string),
+            Some("SHA256")
+        );
+        assert_eq!(
+            asar_integrity.get("hash").and_then(PlistValue::as_string),
+            Some(integrity.hash.as_str())
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -6988,12 +7422,42 @@ mod tests {
         serde_json::from_slice(&archive[16..16 + json_size]).expect("ASAR header JSON should parse")
     }
 
-    fn asar_header_file_offset<'a>(header: &'a JsonValue, path: &[&str]) -> Option<&'a str> {
+    fn asar_header_file<'a>(header: &'a JsonValue, path: &[&str]) -> Option<&'a JsonValue> {
         let mut node = header;
         for component in path {
             node = node.get("files")?.get(*component)?;
         }
+        Some(node)
+    }
+
+    fn asar_header_file_offset<'a>(header: &'a JsonValue, path: &[&str]) -> Option<&'a str> {
+        let node = asar_header_file(header, path)?;
         node.get("offset").and_then(JsonValue::as_str)
+    }
+
+    fn asar_header_file_integrity<'a>(
+        header: &'a JsonValue,
+        path: &[&str],
+    ) -> Option<&'a JsonValue> {
+        asar_header_file(header, path)?.get("integrity")
+    }
+
+    fn windows_asar_integrity_payload(resources: &editpe::ResourceDirectory) -> Option<&[u8]> {
+        resources
+            .root()
+            .get(editpe::ResourceEntryName::from_string(
+                WINDOWS_ASAR_INTEGRITY_TYPE,
+            ))?
+            .as_table()?
+            .get(editpe::ResourceEntryName::from_string(
+                WINDOWS_ASAR_INTEGRITY_ID,
+            ))?
+            .as_table()?
+            .get(editpe::ResourceEntryName::ID(
+                editpe::constants::LANGUAGE_ID_EN_US as u32,
+            ))?
+            .as_data()
+            .map(editpe::ResourceData::data)
     }
 
     fn write_macos_helper_info_plist(path: &Path) {
