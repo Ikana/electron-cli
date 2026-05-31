@@ -69,6 +69,12 @@ struct MakeIconResource {
     to: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct MsiIconResource {
+    from: Utf8PathBuf,
+    id: String,
+}
+
 #[derive(Clone, Debug, Default)]
 struct MsiMakerConfig {
     description: Option<String>,
@@ -76,6 +82,7 @@ struct MsiMakerConfig {
     version: Option<String>,
     manufacturer: Option<String>,
     exe: Option<String>,
+    icon: Option<String>,
     language: Option<u16>,
     program_files_folder_name: Option<String>,
     shortcut_folder_name: Option<String>,
@@ -93,6 +100,8 @@ struct MsiMakerPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     exe: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<MsiIconResource>,
     language: u16,
     program_files_folder_name: String,
     shortcut_folder_name: String,
@@ -208,7 +217,7 @@ fn build_report_for_target(
         target.linux_icon.as_deref(),
         &mut warnings,
     )?;
-    let msi = msi_maker_plan(&package, target_kind, target.msi.as_ref(), &mut warnings);
+    let msi = msi_maker_plan(&package, target_kind, target.msi.as_ref(), &mut warnings)?;
     let artifact = make_artifact_path(&make_dir, &package, target_kind, msi.as_ref());
     if artifact.exists() && !args.force {
         warnings.push(format!(
@@ -284,9 +293,9 @@ fn msi_maker_plan(
     target: MakeTarget,
     configured: Option<&MsiMakerConfig>,
     warnings: &mut Vec<String>,
-) -> Option<MsiMakerPlan> {
+) -> Result<Option<MsiMakerPlan>> {
     if target != MakeTarget::Msi {
-        return None;
+        return Ok(None);
     }
 
     let configured = configured.cloned().unwrap_or_default();
@@ -330,6 +339,7 @@ fn msi_maker_plan(
         .as_deref()
         .and_then(normalized_msi_text)
         .unwrap_or_else(|| format!("{name}.exe"));
+    let icon = msi_icon_plan(package, configured.icon.as_deref(), warnings)?;
     let language = configured.language.unwrap_or(1033);
     let program_files_folder_name = configured
         .program_files_folder_name
@@ -365,12 +375,13 @@ fn msi_maker_plan(
         .and_then(normalized_msi_text)
         .unwrap_or_else(|| "ReallySuppress".to_string());
 
-    Some(MsiMakerPlan {
+    Ok(Some(MsiMakerPlan {
         name,
         version,
         manufacturer,
         description,
         exe,
+        icon,
         language,
         program_files_folder_name,
         shortcut_folder_name,
@@ -378,7 +389,30 @@ fn msi_maker_plan(
         upgrade_code,
         install_level,
         reboot_mode,
-    })
+    }))
+}
+
+fn msi_icon_plan(
+    package: &PackageReport,
+    configured_icon: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Result<Option<MsiIconResource>> {
+    let Some(icon) = configured_icon.filter(|icon| !icon.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let source = msi_icon_candidate(Path::new(package.project().root.as_str()), icon);
+    if !source.is_file() {
+        warnings.push(format!(
+            "Configured maker-wix icon was not found and will not be embedded in the MSI: {}.",
+            source.display()
+        ));
+        return Ok(None);
+    }
+
+    Ok(Some(MsiIconResource {
+        from: utf8_path(source)?,
+        id: "AppIcon.ico".to_string(),
+    }))
 }
 
 fn normalized_msi_text(value: &str) -> Option<String> {
@@ -409,6 +443,15 @@ fn linux_icon_candidate(root: &Path, configured_icon: &str) -> PathBuf {
         path
     } else {
         path.with_extension("png")
+    }
+}
+
+fn msi_icon_candidate(root: &Path, configured_icon: &str) -> PathBuf {
+    let path = resolve_project_path(root, configured_icon);
+    if path.extension().is_some() {
+        path
+    } else {
+        path.with_extension("ico")
     }
 }
 
@@ -579,6 +622,7 @@ fn maker_wix_config(object: &serde_json::Map<String, JsonValue>) -> MsiMakerConf
         version: maker_config_string(object, config, "version"),
         manufacturer: maker_config_string(object, config, "manufacturer"),
         exe: maker_config_string(object, config, "exe"),
+        icon: maker_config_string(object, config, "icon"),
         language: maker_config_u16(object, config, "language"),
         program_files_folder_name: maker_config_string(object, config, "programFilesFolderName"),
         shortcut_folder_name: maker_config_string(object, config, "shortcutFolderName"),
@@ -1587,6 +1631,14 @@ fn create_msi_tables(installer: &mut Package<File>) -> Result<()> {
     )?;
     create_msi_table(
         installer,
+        "Icon",
+        vec![
+            Column::build("Name").primary_key().id_string(72),
+            Column::build("Data").binary(),
+        ],
+    )?;
+    create_msi_table(
+        installer,
         "Shortcut",
         vec![
             Column::build("Shortcut").primary_key().id_string(72),
@@ -1651,21 +1703,21 @@ fn insert_msi_rows(
         "product-code",
         &[&msi.name, &product_version, package.arch()],
     ));
-    insert_msi_table_rows(
-        installer,
-        "Property",
-        vec![
-            vec![s("ProductCode"), s(product_code)],
-            vec![s("ProductLanguage"), s(msi.language.to_string())],
-            vec![s("ProductName"), s(&msi.name)],
-            vec![s("ProductVersion"), s(product_version)],
-            vec![s("Manufacturer"), s(&msi.manufacturer)],
-            vec![s("UpgradeCode"), s(&msi.upgrade_code)],
-            vec![s("ALLUSERS"), s("1")],
-            vec![s("INSTALLLEVEL"), s(msi.install_level.to_string())],
-            vec![s("REBOOT"), s(&msi.reboot_mode)],
-        ],
-    )?;
+    let mut properties = vec![
+        vec![s("ProductCode"), s(product_code)],
+        vec![s("ProductLanguage"), s(msi.language.to_string())],
+        vec![s("ProductName"), s(&msi.name)],
+        vec![s("ProductVersion"), s(product_version)],
+        vec![s("Manufacturer"), s(&msi.manufacturer)],
+        vec![s("UpgradeCode"), s(&msi.upgrade_code)],
+        vec![s("ALLUSERS"), s("1")],
+        vec![s("INSTALLLEVEL"), s(msi.install_level.to_string())],
+        vec![s("REBOOT"), s(&msi.reboot_mode)],
+    ];
+    if let Some(icon) = &msi.icon {
+        properties.push(vec![s("ARPPRODUCTICON"), s(&icon.id)]);
+    }
+    insert_msi_table_rows(installer, "Property", properties)?;
 
     let program_files_dir = msi_program_files_directory(package.arch());
     let install_folder = msi_filename("APPDIR", &msi.program_files_folder_name);
@@ -1776,6 +1828,10 @@ fn insert_msi_rows(
         ]],
     )?;
 
+    if let Some(icon) = &msi.icon {
+        insert_msi_icon(installer, icon)?;
+    }
+
     if let (Some(component), Some(target_file)) =
         (&payload.shortcut_component, &payload.shortcut_target_file)
     {
@@ -1794,7 +1850,10 @@ fn insert_msi_rows(
                     .clone()
                     .unwrap_or_else(|| format!("Launch {}.", single_line(&msi.name)))),
                 Value::Null,
-                Value::Null,
+                msi.icon
+                    .as_ref()
+                    .map(|icon| s(&icon.id))
+                    .unwrap_or(Value::Null),
                 Value::Null,
                 Value::Null,
                 s("INSTALLFOLDER"),
@@ -1849,6 +1908,22 @@ fn insert_msi_rows(
             action_text("RemoveShortcuts", "Removing shortcuts", "Shortcut: [1]"),
         ],
     )
+}
+
+fn insert_msi_icon(installer: &mut Package<File>, icon: &MsiIconResource) -> Result<()> {
+    insert_msi_table_rows(installer, "Icon", vec![vec![s(&icon.id), Value::Binary]])?;
+
+    let icon_bytes = fs::read(icon.from.as_str())
+        .with_context(|| format!("Could not read MSI icon {}", icon.from))?;
+    let mut stream = installer
+        .write_stream(&icon.id)
+        .with_context(|| format!("Could not create MSI icon stream {}", icon.id))?;
+    stream
+        .write_all(&icon_bytes)
+        .with_context(|| format!("Could not write MSI icon stream {}", icon.id))?;
+    stream
+        .flush()
+        .with_context(|| format!("Could not flush MSI icon stream {}", icon.id))
 }
 
 fn insert_msi_table_rows(
@@ -2892,6 +2967,7 @@ mod tests {
                             "manufacturer":"Acme Tools",
                             "description":"Desk workflows",
                             "exe":"starter-app.exe",
+                            "icon":"assets/app.ico",
                             "language":1043,
                             "programFilesFolderName":"Desk Suite Install",
                             "shortcutFolderName":"Desk Tools",
@@ -2905,6 +2981,7 @@ mod tests {
             }"#,
         )
         .expect("package.json should be written");
+        let icon_bytes = write_fake_icon(&root);
         write_app_file(&root);
         write_fake_electron_dist(&root);
 
@@ -2929,6 +3006,12 @@ mod tests {
         assert_eq!(msi.manufacturer, "Acme Tools");
         assert_eq!(msi.description.as_deref(), Some("Desk workflows"));
         assert_eq!(msi.exe, "starter-app.exe");
+        let icon = msi.icon.as_ref().expect("msi icon should be resolved");
+        assert_eq!(icon.id, "AppIcon.ico");
+        assert_eq!(
+            fs::read(icon.from.as_str()).expect("icon should read"),
+            icon_bytes
+        );
         assert_eq!(msi.language, 1043);
         assert_eq!(msi.program_files_folder_name, "Desk Suite Install");
         assert_eq!(msi.shortcut_folder_name, "Desk Tools");
@@ -3410,6 +3493,7 @@ mod tests {
                             "manufacturer":"Acme Tools",
                             "description":"Desk workflows",
                             "exe":"starter-app.exe",
+                            "icon":"assets/app.ico",
                             "language":1043,
                             "programFilesFolderName":"Desk Suite Install",
                             "shortcutFolderName":"Desk Tools",
@@ -3423,6 +3507,7 @@ mod tests {
             }"#,
         )
         .expect("package.json should be written");
+        let icon_bytes = write_fake_icon(&root);
         write_app_file(&root);
         write_fake_electron_dist(&root);
 
@@ -3468,6 +3553,21 @@ mod tests {
         ]));
         assert!(properties.contains(&vec![Value::from("INSTALLLEVEL"), Value::from("4")]));
         assert!(properties.contains(&vec![Value::from("REBOOT"), Value::from("Force")]));
+        assert!(properties.contains(&vec![
+            Value::from("ARPPRODUCTICON"),
+            Value::from("AppIcon.ico")
+        ]));
+
+        let icons = msi_rows(&mut installer, "Icon");
+        assert!(icons.contains(&vec![Value::from("AppIcon.ico"), Value::Binary]));
+        assert!(installer.has_stream("AppIcon.ico"));
+        let mut embedded_icon = Vec::new();
+        installer
+            .read_stream("AppIcon.ico")
+            .expect("icon stream should open")
+            .read_to_end(&mut embedded_icon)
+            .expect("icon stream should read");
+        assert_eq!(embedded_icon, icon_bytes);
 
         let features = msi_rows(&mut installer, "Feature");
         assert!(features
@@ -3489,6 +3589,7 @@ mod tests {
             row[2] == Value::from("SHORTCUT|Launch Desk")
                 && row[4] == Value::from("[#F0002]")
                 && row[6] == Value::from("Desk workflows")
+                && row[8] == Value::from("AppIcon.ico")
         }));
 
         let _ = fs::remove_dir_all(root);
@@ -3636,6 +3737,15 @@ mod tests {
         fs::create_dir_all(root.join("src")).expect("src should be created");
         fs::write(root.join("src/main.js"), "console.log('hello');")
             .expect("main file should be written");
+    }
+
+    fn write_fake_icon(root: &Path) -> Vec<u8> {
+        let icon = vec![
+            0, 0, 1, 0, 1, 0, 16, 16, 0, 0, 1, 0, 32, 0, 0, 0, 0, 0, 22, 0, 0, 0,
+        ];
+        fs::create_dir_all(root.join("assets")).expect("assets should be created");
+        fs::write(root.join("assets/app.ico"), &icon).expect("icon should be written");
+        icon
     }
 
     fn write_fake_macos_bundle(bundle_dir: &Path, executable_name: &str) {
