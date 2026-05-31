@@ -67,9 +67,18 @@ struct PackageMetadata {
     extend_helper_info: ExtendInfoPlan,
     protocols: Vec<MacosProtocolPlan>,
     usage_description: BTreeMap<String, String>,
+    windows_version: Option<WindowsVersionMetadata>,
     icon: Option<IconResource>,
     extra_resources: Vec<CopyStep>,
     darwin_dark_mode_support: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WindowsVersionMetadata {
+    executable: Utf8PathBuf,
+    strings: BTreeMap<String, String>,
+    file_version: Option<String>,
+    product_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -194,6 +203,7 @@ enum PackageStatus {
 #[derive(Debug, Default)]
 struct PackageJsonConfig {
     product_name: Option<String>,
+    author_name: Option<String>,
     app_version: Option<String>,
     packager: PackagerConfig,
     warnings: Vec<String>,
@@ -213,6 +223,7 @@ struct PackagerConfig {
     extend_helper_info: ExtendInfoConfig,
     protocols: Vec<MacosProtocolPlan>,
     usage_description: BTreeMap<String, String>,
+    win32_metadata: Win32MetadataConfig,
     icon: Vec<String>,
     extra_resource: Vec<String>,
     ignore: Vec<String>,
@@ -221,6 +232,19 @@ struct PackagerConfig {
     darwin_dark_mode_support: bool,
     osx_sign: MacosSignConfig,
     osx_notarize: MacosNotarizeConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Win32MetadataConfig {
+    configured: bool,
+    invalid_type: bool,
+    company_name: Option<String>,
+    file_description: Option<String>,
+    original_filename: Option<String>,
+    product_name: Option<String>,
+    internal_name: Option<String>,
+    application_manifest: Option<String>,
+    requested_execution_level: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -379,7 +403,7 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
     let (metadata, metadata_warnings) = package_metadata(
         root,
         &package_config,
-        &artifact_name,
+        &app_name,
         &bundle_dir,
         &executable_name,
         &app_resources_dir,
@@ -880,6 +904,9 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
     if let Some(version) = &report.metadata.app_version {
         println!("  app version: {version}");
     }
+    if let Some(windows_version) = &report.metadata.windows_version {
+        println!("  Windows version metadata: {}", windows_version.executable);
+    }
     if let Some(file) = &report.metadata.extend_info.file {
         println!("  extend Info.plist: {file}");
     } else if !report.metadata.extend_info.keys.is_empty() {
@@ -1077,6 +1104,7 @@ fn read_package_json_config(snapshot: &ProjectSnapshot) -> Result<PackageJsonCon
             .and_then(|package| package.get("productName"))
             .and_then(JsonValue::as_str)
             .map(ToOwned::to_owned),
+        author_name: project_config.package().and_then(package_author_name),
         app_version: project_config
             .package()
             .and_then(|package| package.get("version"))
@@ -1101,6 +1129,11 @@ fn parse_packager_config(value: &JsonValue) -> PackagerConfig {
         extend_helper_info: parse_extend_info_config(value.get("extendHelperInfo")),
         protocols: parse_macos_protocols(value.get("protocols")),
         usage_description: string_map(value.get("usageDescription")),
+        win32_metadata: parse_win32_metadata_config(
+            value
+                .get("win32metadata")
+                .or_else(|| value.get("win32Metadata")),
+        ),
         icon: string_list(value.get("icon")),
         extra_resource: string_list(value.get("extraResource")),
         ignore: string_list(value.get("ignore")),
@@ -1113,6 +1146,62 @@ fn parse_packager_config(value: &JsonValue) -> PackagerConfig {
         osx_sign: parse_macos_sign_config(value.get("osxSign")),
         osx_notarize: parse_macos_notarize_config(value.get("osxNotarize")),
     }
+}
+
+fn package_author_name(package: &JsonValue) -> Option<String> {
+    match package.get("author") {
+        Some(JsonValue::String(author)) => Some(author.clone()),
+        Some(JsonValue::Object(author)) => author
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn parse_win32_metadata_config(value: Option<&JsonValue>) -> Win32MetadataConfig {
+    let Some(value) = value else {
+        return Win32MetadataConfig::default();
+    };
+    let mut config = Win32MetadataConfig {
+        configured: true,
+        ..Win32MetadataConfig::default()
+    };
+    let Some(object) = value.as_object() else {
+        config.invalid_type = true;
+        return config;
+    };
+
+    config.company_name = object
+        .get("CompanyName")
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned);
+    config.file_description = object
+        .get("FileDescription")
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned);
+    config.original_filename = object
+        .get("OriginalFilename")
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned);
+    config.product_name = object
+        .get("ProductName")
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned);
+    config.internal_name = object
+        .get("InternalName")
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned);
+    config.application_manifest = object
+        .get("application-manifest")
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned);
+    config.requested_execution_level = object
+        .get("requested-execution-level")
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned);
+
+    config
 }
 
 fn parse_asar_config(value: Option<&JsonValue>) -> AsarConfig {
@@ -1495,15 +1584,16 @@ fn string_list(value: Option<&JsonValue>) -> Vec<String> {
 fn package_metadata(
     root: &Path,
     config: &PackageJsonConfig,
-    artifact_name: &str,
+    app_name: &str,
     bundle_dir: &Path,
     executable_name: &str,
     app_resources_dir: &Path,
     platform: &str,
 ) -> Result<(PackageMetadata, Vec<String>)> {
     let mut warnings = Vec::new();
+    let artifact_name = sanitize_artifact_name(app_name);
     let icon_context = IconResolutionContext {
-        artifact_name,
+        artifact_name: &artifact_name,
         bundle_dir,
         executable_name,
         app_resources_dir,
@@ -1524,11 +1614,20 @@ fn package_metadata(
         .app_version
         .clone()
         .or_else(|| config.app_version.clone());
+    let windows_version = windows_version_metadata(
+        config,
+        app_name,
+        executable_name,
+        bundle_dir,
+        platform,
+        app_version.as_deref(),
+        &mut warnings,
+    )?;
     let bundle_identifier = config
         .packager
         .app_bundle_id
         .clone()
-        .unwrap_or_else(|| default_bundle_identifier(artifact_name));
+        .unwrap_or_else(|| default_bundle_identifier(&artifact_name));
     let helper_bundle_identifier = filter_cfbundle_identifier(
         config
             .packager
@@ -1554,12 +1653,102 @@ fn package_metadata(
             extend_helper_info,
             protocols: config.packager.protocols.clone(),
             usage_description: config.packager.usage_description.clone(),
+            windows_version,
             icon,
             extra_resources,
             darwin_dark_mode_support: config.packager.darwin_dark_mode_support,
         },
         warnings,
     ))
+}
+
+fn windows_version_metadata(
+    config: &PackageJsonConfig,
+    app_name: &str,
+    executable_name: &str,
+    bundle_dir: &Path,
+    platform: &str,
+    app_version: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Result<Option<WindowsVersionMetadata>> {
+    if platform != "win32" {
+        return Ok(None);
+    }
+
+    let win32 = &config.packager.win32_metadata;
+    if win32.invalid_type {
+        warnings.push("packagerConfig.win32metadata must be an object.".to_string());
+    }
+    if win32.application_manifest.is_some() {
+        warnings.push(
+            "packagerConfig.win32metadata.application-manifest is recognized but Rust-native Windows manifest replacement is not implemented yet.".to_string(),
+        );
+    }
+    if win32.requested_execution_level.is_some() {
+        warnings.push(
+            "packagerConfig.win32metadata.requested-execution-level is recognized but Rust-native Windows manifest editing is not implemented yet.".to_string(),
+        );
+    }
+
+    let mut strings = BTreeMap::new();
+    insert_non_empty(
+        &mut strings,
+        "CompanyName",
+        win32
+            .company_name
+            .as_deref()
+            .or(config.author_name.as_deref()),
+    );
+    insert_non_empty(
+        &mut strings,
+        "FileDescription",
+        win32.file_description.as_deref().or(Some(app_name)),
+    );
+    insert_non_empty(
+        &mut strings,
+        "InternalName",
+        win32.internal_name.as_deref().or(Some(app_name)),
+    );
+    insert_non_empty(
+        &mut strings,
+        "OriginalFilename",
+        win32.original_filename.as_deref().or(Some(executable_name)),
+    );
+    insert_non_empty(
+        &mut strings,
+        "ProductName",
+        win32.product_name.as_deref().or(Some(app_name)),
+    );
+    insert_non_empty(
+        &mut strings,
+        "LegalCopyright",
+        config.packager.app_copyright.as_deref(),
+    );
+    insert_non_empty(&mut strings, "ProductVersion", app_version);
+
+    let file_version = config
+        .packager
+        .build_version
+        .as_deref()
+        .or(app_version)
+        .map(ToOwned::to_owned);
+    insert_non_empty(&mut strings, "FileVersion", file_version.as_deref());
+
+    Ok(Some(WindowsVersionMetadata {
+        executable: utf8_path(bundle_dir.join(executable_name))?,
+        strings,
+        file_version,
+        product_version: app_version.map(ToOwned::to_owned),
+    }))
+}
+
+fn insert_non_empty(map: &mut BTreeMap<String, String>, key: &str, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    if !value.is_empty() {
+        map.insert(key.to_string(), value.to_string());
+    }
 }
 
 fn package_asar(
@@ -3047,36 +3236,170 @@ fn apply_package_metadata(report: &PackageReport) -> Result<()> {
 }
 
 fn apply_windows_metadata(report: &PackageReport) -> Result<()> {
-    let Some(icon) = &report.metadata.icon else {
+    let icon = report
+        .metadata
+        .icon
+        .as_ref()
+        .map(|icon| Path::new(icon.from.as_str()));
+    let version = report.metadata.windows_version.as_ref();
+    let executable = version
+        .map(|metadata| Path::new(metadata.executable.as_str()))
+        .or_else(|| {
+            report
+                .metadata
+                .icon
+                .as_ref()
+                .map(|icon| Path::new(icon.to.as_str()))
+        });
+    let Some(executable) = executable else {
         return Ok(());
     };
 
-    apply_windows_executable_icon(Path::new(icon.to.as_str()), Path::new(icon.from.as_str()))
+    apply_windows_executable_resources(executable, icon, version)
 }
 
+#[cfg(test)]
 fn apply_windows_executable_icon(executable: &Path, icon: &Path) -> Result<()> {
-    let icon_data = fs::read(icon)
-        .with_context(|| format!("Could not read Windows icon {}", icon.display()))?;
+    apply_windows_executable_resources(executable, Some(icon), None)
+}
+
+fn apply_windows_executable_resources(
+    executable: &Path,
+    icon: Option<&Path>,
+    version_metadata: Option<&WindowsVersionMetadata>,
+) -> Result<()> {
+    let icon_data = icon
+        .map(|icon| {
+            fs::read(icon)
+                .with_context(|| format!("Could not read Windows icon {}", icon.display()))
+        })
+        .transpose()?;
     let mut image = editpe::Image::parse_file(executable).with_context(|| {
         format!(
-            "Could not parse Windows executable for icon embedding: {}",
+            "Could not parse Windows executable for resource editing: {}",
             executable.display()
         )
     })?;
     let mut resources = image.resource_directory().cloned().unwrap_or_default();
-    resources
-        .remove_main_icon()
-        .context("Could not remove existing Windows executable icon resource")?;
-    resources
-        .set_main_icon(icon_data)
-        .with_context(|| format!("Could not parse Windows icon {}", icon.display()))?;
+    if let Some(icon_data) = icon_data {
+        resources
+            .remove_main_icon()
+            .context("Could not remove existing Windows executable icon resource")?;
+        let icon = icon.expect("icon path should be present");
+        resources
+            .set_main_icon(icon_data)
+            .with_context(|| format!("Could not parse Windows icon {}", icon.display()))?;
+    }
+    if let Some(version_metadata) = version_metadata {
+        apply_windows_version_info(&mut resources, version_metadata)?;
+    }
     image
         .set_resource_directory(resources)
         .context("Could not update Windows executable resources")?;
     image.write_file(executable).with_context(|| {
         format!(
-            "Could not write Windows executable with embedded icon: {}",
+            "Could not write Windows executable with updated resources: {}",
             executable.display()
+        )
+    })
+}
+
+fn apply_windows_version_info(
+    resources: &mut editpe::ResourceDirectory,
+    metadata: &WindowsVersionMetadata,
+) -> Result<()> {
+    let mut version_info = resources
+        .get_version_info()
+        .context("Could not read Windows executable version information")?
+        .unwrap_or_default();
+    ensure_windows_version_info_tables(&mut version_info);
+
+    if let Some(file_version) = &metadata.file_version {
+        version_info.info.file_version = windows_fixed_version(file_version)?;
+    }
+    if let Some(product_version) = &metadata.product_version {
+        version_info.info.product_version = windows_fixed_version(product_version)?;
+    }
+
+    let string_table = version_info
+        .strings
+        .first_mut()
+        .expect("version string table should exist");
+    for (key, value) in &metadata.strings {
+        if !value.is_empty() {
+            string_table.strings.insert(key.clone(), value.clone());
+        }
+    }
+
+    resources
+        .set_version_info(&version_info)
+        .context("Could not update Windows executable version information")
+}
+
+fn ensure_windows_version_info_tables(version_info: &mut editpe::VersionInfo) {
+    if version_info.strings.is_empty() {
+        version_info.strings.push(editpe::VersionStringTable {
+            key: windows_version_string_table_key(),
+            strings: Default::default(),
+        });
+    }
+    if version_info.vars.is_empty() {
+        version_info.vars.push(editpe::types::VersionU16 {
+            major: editpe::constants::LANGUAGE_ID_EN_US,
+            minor: editpe::constants::CODE_PAGE_ID_EN_US,
+        });
+    }
+}
+
+fn windows_version_string_table_key() -> String {
+    format!(
+        "{:04X}{:04X}",
+        editpe::constants::LANGUAGE_ID_EN_US,
+        editpe::constants::CODE_PAGE_ID_EN_US
+    )
+}
+
+fn windows_fixed_version(value: &str) -> Result<editpe::types::VersionU32> {
+    let parts = windows_version_parts(value)?;
+    Ok(editpe::types::VersionU32 {
+        major: ((parts[0] as u32) << 16) | parts[1] as u32,
+        minor: ((parts[2] as u32) << 16) | parts[3] as u32,
+    })
+}
+
+fn windows_version_parts(value: &str) -> Result<[u16; 4]> {
+    let raw_parts: Vec<_> = value.split('.').collect();
+    if raw_parts.is_empty() || raw_parts.len() > 4 {
+        bail!(
+            "Incorrectly formatted Windows version string: \"{}\". Should have at least one and at most four components.",
+            value
+        );
+    }
+
+    let mut parts = [0; 4];
+    for (index, raw_part) in raw_parts.iter().enumerate() {
+        parts[index] = windows_version_part(value, raw_part)?;
+    }
+    Ok(parts)
+}
+
+fn windows_version_part(version: &str, raw_part: &str) -> Result<u16> {
+    let raw_part = raw_part.trim_start();
+    let digits: String = raw_part
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        bail!(
+            "Incorrectly formatted Windows version string: \"{}\". Component \"{}\" could not be parsed as an integer.",
+            version,
+            raw_part
+        );
+    }
+    digits.parse::<u16>().with_context(|| {
+        format!(
+            "Incorrectly formatted Windows version string: \"{}\". Component \"{}\" is outside the 0-65535 range.",
+            version, raw_part
         )
     })
 }
@@ -3934,6 +4257,9 @@ impl PackagerConfig {
         if !other.usage_description.is_empty() {
             self.usage_description = other.usage_description;
         }
+        if other.win32_metadata.configured {
+            self.win32_metadata = other.win32_metadata;
+        }
         if !other.icon.is_empty() {
             self.icon = other.icon;
         }
@@ -4715,6 +5041,100 @@ mod tests {
     }
 
     #[test]
+    fn plans_windows_version_metadata_from_packager_config() {
+        let root = unique_temp_dir("windows-version-plan");
+        write_windows_metadata_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("win32".to_string()),
+            arch: None,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        let windows_version = report
+            .metadata
+            .windows_version
+            .as_ref()
+            .expect("Windows version metadata should be planned");
+        assert!(windows_version
+            .executable
+            .as_str()
+            .ends_with(report.executable_name.as_str()));
+        assert_eq!(
+            windows_version
+                .strings
+                .get("CompanyName")
+                .map(String::as_str),
+            Some("Example Corp")
+        );
+        assert_eq!(
+            windows_version
+                .strings
+                .get("FileDescription")
+                .map(String::as_str),
+            Some("Starter Desktop")
+        );
+        assert_eq!(
+            windows_version
+                .strings
+                .get("InternalName")
+                .map(String::as_str),
+            Some("Starter Pro")
+        );
+        assert_eq!(
+            windows_version
+                .strings
+                .get("OriginalFilename")
+                .map(String::as_str),
+            Some(report.executable_name.as_str())
+        );
+        assert_eq!(
+            windows_version
+                .strings
+                .get("ProductName")
+                .map(String::as_str),
+            Some("Starter Suite")
+        );
+        assert_eq!(
+            windows_version
+                .strings
+                .get("LegalCopyright")
+                .map(String::as_str),
+            Some("Copyright 2026 Example")
+        );
+        assert_eq!(
+            windows_version
+                .strings
+                .get("FileVersion")
+                .map(String::as_str),
+            Some("234.5")
+        );
+        assert_eq!(
+            windows_version
+                .strings
+                .get("ProductVersion")
+                .map(String::as_str),
+            Some("2.3.4-alpha.1")
+        );
+        assert_eq!(windows_version.file_version.as_deref(), Some("234.5"));
+        assert_eq!(
+            windows_version.product_version.as_deref(),
+            Some("2.3.4-alpha.1")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn embeds_windows_icon_into_portable_executable() {
         let root = unique_temp_dir("windows-icon-embed");
         fs::create_dir_all(root.join("assets")).expect("assets should be created");
@@ -4734,6 +5154,70 @@ mod tests {
                 .get_main_icon()
                 .expect("main icon should be readable"),
             Some(b"icon-data".as_slice())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn embeds_windows_version_metadata_into_portable_executable() {
+        let root = unique_temp_dir("windows-version-embed");
+        let executable = root.join("starter.exe");
+        write_minimal_pe_executable(&executable);
+        let mut strings = BTreeMap::new();
+        strings.insert("CompanyName".to_string(), "Example Corp".to_string());
+        strings.insert("FileDescription".to_string(), "Starter Desktop".to_string());
+        strings.insert("ProductName".to_string(), "Starter Suite".to_string());
+        let metadata = WindowsVersionMetadata {
+            executable: utf8_path(executable.clone()).expect("path should be UTF-8"),
+            strings,
+            file_version: Some("2.3.4-alpha".to_string()),
+            product_version: Some("5.6".to_string()),
+        };
+
+        apply_windows_executable_resources(&executable, None, Some(&metadata))
+            .expect("version metadata should be embedded");
+
+        let image = editpe::Image::parse_file(&executable).expect("executable should parse");
+        let resources = image
+            .resource_directory()
+            .expect("resource directory should exist");
+        let version_info = resources
+            .get_version_info()
+            .expect("version info should be readable")
+            .expect("version info should exist");
+        let file_version = version_info.info.file_version;
+        let product_version = version_info.info.product_version;
+        assert_eq!(
+            file_version,
+            editpe::types::VersionU32 {
+                major: (2 << 16) | 3,
+                minor: 4 << 16,
+            }
+        );
+        assert_eq!(
+            product_version,
+            editpe::types::VersionU32 {
+                major: (5 << 16) | 6,
+                minor: 0,
+            }
+        );
+        let strings = &version_info
+            .strings
+            .first()
+            .expect("version string table should exist")
+            .strings;
+        assert_eq!(
+            strings.get("CompanyName").map(String::as_str),
+            Some("Example Corp")
+        );
+        assert_eq!(
+            strings.get("FileDescription").map(String::as_str),
+            Some("Starter Desktop")
+        );
+        assert_eq!(
+            strings.get("ProductName").map(String::as_str),
+            Some("Starter Suite")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -5867,6 +6351,34 @@ mod tests {
                         "icon": "assets/starter",
                         "extraResource": "assets/config.json",
                         "darwinDarkModeSupport": true
+                    }
+                }
+            }"#,
+        )
+        .expect("package.json should be written");
+    }
+
+    fn write_windows_metadata_package_json(root: &Path) {
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name": "starter-app",
+                "productName": "Starter Pro",
+                "version": "2.3.4-alpha.1",
+                "author": { "name": "Example Corp" },
+                "main": "src/main.js",
+                "devDependencies": {
+                    "electron": "30.0.0"
+                },
+                "electronCli": {
+                    "packagerConfig": {
+                        "executableName": "StarterExec",
+                        "buildVersion": "234.5",
+                        "appCopyright": "Copyright 2026 Example",
+                        "win32metadata": {
+                            "FileDescription": "Starter Desktop",
+                            "ProductName": "Starter Suite"
+                        }
                     }
                 }
             }"#,
