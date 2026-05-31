@@ -5,9 +5,12 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use app_store_connect::UnifiedApiKey;
 use apple_codesign::{
     cryptography::{parse_pfx_data, PrivateKey},
-    BundleSigner, CodeSignatureFlags, SettingsScope, SigningSettings,
+    stapling::Stapler,
+    BundleSigner, CodeSignatureFlags, NotarizationUpload, Notarizer, SettingsScope,
+    SigningSettings,
 };
 use camino::Utf8PathBuf;
 use plist::{Dictionary as PlistDictionary, Value as PlistValue};
@@ -17,6 +20,7 @@ use serde_json::Value as JsonValue;
 use crate::{cli::PackageArgs, output, project::ProjectSnapshot};
 
 const APPLE_TIMESTAMP_URL: &str = "http://timestamp.apple.com/ts01";
+const MACOS_NOTARIZATION_WAIT_TIMEOUT_SECONDS: u64 = 600;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct PackageReport {
@@ -98,9 +102,18 @@ struct MacosSignPlan {
 struct MacosNotarizePlan {
     configured: bool,
     enabled: bool,
+    will_execute: bool,
     auth_method: Option<String>,
+    apple_api_key: Option<Utf8PathBuf>,
+    #[serde(skip)]
+    apple_api_key_id: RedactedSecret,
+    #[serde(skip)]
+    apple_api_issuer: RedactedSecret,
     keychain_profile: Option<String>,
     keychain: Option<String>,
+    wait: bool,
+    wait_timeout_seconds: u64,
+    staple: bool,
 }
 
 #[derive(Clone, Default)]
@@ -190,10 +203,13 @@ struct MacosNotarizeConfig {
     apple_id_password_set: bool,
     team_id_set: bool,
     apple_api_key: Option<String>,
-    apple_api_key_id_set: bool,
-    apple_api_issuer_set: bool,
+    apple_api_key_id: Option<String>,
+    apple_api_issuer: Option<String>,
     keychain_profile: Option<String>,
     keychain: Option<String>,
+    wait: Option<bool>,
+    wait_timeout_seconds: Option<u64>,
+    staple: Option<bool>,
 }
 
 pub fn run(args: PackageArgs) -> Result<()> {
@@ -415,6 +431,7 @@ pub(crate) fn execute_package(report: &PackageReport, force: bool) -> Result<()>
         &report.project,
     )?;
     execute_macos_signing(report)?;
+    execute_macos_notarization(report)?;
 
     Ok(())
 }
@@ -511,6 +528,106 @@ fn execute_macos_signing(report: &PackageReport) -> Result<()> {
     let _ = fs::remove_dir_all(&signing_parent);
 
     Ok(())
+}
+
+fn execute_macos_notarization(report: &PackageReport) -> Result<()> {
+    if report.platform != "darwin" || !report.signing.macos.notarize.will_execute {
+        return Ok(());
+    }
+
+    let notarize = &report.signing.macos.notarize;
+    let bundle_dir = Path::new(report.bundle_dir.as_str());
+    let wait_limit = notarize.wait.then_some(std::time::Duration::from_secs(
+        notarize.wait_timeout_seconds,
+    ));
+    let notarizer = macos_notarizer(notarize)?;
+    let upload = notarizer
+        .notarize_path(bundle_dir, wait_limit)
+        .with_context(|| format!("Could not notarize macOS bundle {}", bundle_dir.display()))?;
+
+    if notarize.staple {
+        match upload {
+            NotarizationUpload::NotaryResponse(_) => {
+                let stapler =
+                    Stapler::new().context("Could not prepare macOS notarization stapler")?;
+                stapler.staple_path(bundle_dir).with_context(|| {
+                    format!(
+                        "Could not staple notarization ticket to {}",
+                        bundle_dir.display()
+                    )
+                })?;
+            }
+            NotarizationUpload::UploadId(upload_id) => {
+                bail!(
+                    "macOS notarization upload {upload_id} was submitted without waiting; stapling requires a completed notarization result."
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn macos_notarizer(notarize: &MacosNotarizePlan) -> Result<Notarizer> {
+    let api_key_path = notarize
+        .apple_api_key
+        .as_ref()
+        .context("macOS notarization requires appleApiKey")?;
+    let api_key_path = Path::new(api_key_path.as_str());
+    let key_id = notarize
+        .apple_api_key_id
+        .as_deref()
+        .context("macOS notarization requires appleApiKeyId")?;
+    let issuer = notarize
+        .apple_api_issuer
+        .as_deref()
+        .context("macOS notarization requires appleApiIssuer")?;
+
+    if path_extension(api_key_path) == Some("json") {
+        return Notarizer::from_api_key(api_key_path)
+            .with_context(|| format!("Could not load Apple API key {}", api_key_path.display()));
+    }
+
+    let temp_api_key = temporary_unified_api_key(issuer, key_id, api_key_path)?;
+    Notarizer::from_api_key(&temp_api_key.path)
+        .with_context(|| format!("Could not load Apple API key {}", api_key_path.display()))
+}
+
+struct TemporaryFile {
+    path: PathBuf,
+}
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn temporary_unified_api_key(
+    issuer: &str,
+    key_id: &str,
+    private_key_path: &Path,
+) -> Result<TemporaryFile> {
+    let unique_suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "electron-cli-notary-key-{}-{unique_suffix}.json",
+        std::process::id()
+    ));
+    let unified = UnifiedApiKey::from_ecdsa_pem_path(issuer, key_id, private_key_path)
+        .with_context(|| {
+            format!(
+                "Could not read Apple API private key {}",
+                private_key_path.display()
+            )
+        })?;
+    unified
+        .write_json_file(&path)
+        .with_context(|| format!("Could not write temporary Apple API key {}", path.display()))?;
+
+    Ok(TemporaryFile { path })
 }
 
 fn macos_signing_settings<'key>(report: &PackageReport) -> Result<SigningSettings<'key>> {
@@ -650,6 +767,35 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
         );
         if let Some(method) = &report.signing.macos.notarize.auth_method {
             println!("  notarization auth: {method}");
+        }
+        if let Some(path) = &report.signing.macos.notarize.apple_api_key {
+            println!("  Apple API key: {path}");
+        }
+        println!(
+            "  notarization execution: {}",
+            if report.signing.macos.notarize.will_execute {
+                "enabled"
+            } else {
+                "not available"
+            }
+        );
+        if report.signing.macos.notarize.will_execute {
+            println!(
+                "  notarization wait: {}",
+                if report.signing.macos.notarize.wait {
+                    format!("{}s", report.signing.macos.notarize.wait_timeout_seconds)
+                } else {
+                    "disabled".to_string()
+                }
+            );
+            println!(
+                "  notarization stapling: {}",
+                if report.signing.macos.notarize.staple {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
         }
     }
 
@@ -856,14 +1002,14 @@ fn parse_macos_notarize_config(value: Option<&JsonValue>) -> MacosNotarizeConfig
                 .get("appleApiKey")
                 .and_then(JsonValue::as_str)
                 .map(ToOwned::to_owned),
-            apple_api_key_id_set: object
+            apple_api_key_id: object
                 .get("appleApiKeyId")
                 .and_then(JsonValue::as_str)
-                .is_some(),
-            apple_api_issuer_set: object
+                .map(ToOwned::to_owned),
+            apple_api_issuer: object
                 .get("appleApiIssuer")
                 .and_then(JsonValue::as_str)
-                .is_some(),
+                .map(ToOwned::to_owned),
             keychain_profile: object
                 .get("keychainProfile")
                 .and_then(JsonValue::as_str)
@@ -872,6 +1018,12 @@ fn parse_macos_notarize_config(value: Option<&JsonValue>) -> MacosNotarizeConfig
                 .get("keychain")
                 .and_then(JsonValue::as_str)
                 .map(ToOwned::to_owned),
+            wait: object.get("wait").and_then(JsonValue::as_bool),
+            wait_timeout_seconds: object
+                .get("maxWaitSeconds")
+                .or_else(|| object.get("waitTimeoutSeconds"))
+                .and_then(JsonValue::as_u64),
+            staple: object.get("staple").and_then(JsonValue::as_bool),
         },
         Some(_) => MacosNotarizeConfig {
             configured: true,
@@ -964,7 +1116,7 @@ fn package_signing(
         platform,
         &mut warnings,
     )?;
-    let notarize = macos_notarize_plan(root, config, platform, &mut warnings);
+    let notarize = macos_notarize_plan(root, config, platform, &sign, &mut warnings)?;
 
     Ok((
         PackageSigningPlan {
@@ -1163,22 +1315,34 @@ fn macos_notarize_plan(
     root: &Path,
     package_config: &PackageJsonConfig,
     platform: &str,
+    sign: &MacosSignPlan,
     warnings: &mut Vec<String>,
-) -> MacosNotarizePlan {
+) -> Result<MacosNotarizePlan> {
     let config = &package_config.packager.osx_notarize;
     if config.invalid_type {
         warnings.push("packagerConfig.osxNotarize must be false, true, or an object.".to_string());
     }
 
     let auth_method = macos_notarize_auth_method(config);
+    let apple_api_key = config
+        .apple_api_key
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| utf8_path(resolve_project_path(root, path)))
+        .transpose()?;
+    let api_key_auth = auth_method.as_deref() == Some("app-store-connect-api-key");
+    let staple = config.staple.unwrap_or(true);
+    let wait = staple || config.wait.unwrap_or(true);
+    let wait_timeout_seconds = config
+        .wait_timeout_seconds
+        .unwrap_or(MACOS_NOTARIZATION_WAIT_TIMEOUT_SECONDS);
+    let will_execute =
+        config.enabled && platform == "darwin" && sign.for_notarization && api_key_auth;
+
     if config.configured && platform != "darwin" {
         warnings.push(format!(
             "macOS notarization is configured but ignored for target platform {platform}."
         ));
-    } else if config.enabled {
-        warnings.push(
-            "macOS notarization is configured, but Rust-native notarization is not implemented yet.".to_string(),
-        );
     }
 
     if config.enabled && !package_config.packager.osx_sign.enabled {
@@ -1204,28 +1368,53 @@ fn macos_notarize_plan(
             "macOS notarization requires a Developer ID signature; Rust-native ad-hoc signing is not notarizable.".to_string(),
         );
     }
+    if config.enabled
+        && platform == "darwin"
+        && package_config.packager.osx_sign.enabled
+        && !sign.for_notarization
+    {
+        warnings.push(
+            "macOS notarization execution requires Rust-native p12File Developer ID signing with a secure timestamp.".to_string(),
+        );
+    }
     if config.enabled && auth_method.is_none() {
         warnings.push(
             "macOS notarization config is missing a complete notarytool authentication set: appleId/appleIdPassword/teamId, appleApiKey/appleApiKeyId/appleApiIssuer, or keychainProfile.".to_string(),
         );
     }
-    if let Some(api_key) = &config.apple_api_key {
-        let path = resolve_project_path(root, api_key);
-        if !path.exists() {
+    if config.enabled
+        && platform == "darwin"
+        && matches!(
+            auth_method.as_deref(),
+            Some("keychain-profile") | Some("apple-id")
+        )
+    {
+        warnings.push(
+            "Rust-native macOS notarization execution currently requires appleApiKey, appleApiKeyId, and appleApiIssuer; keychain profile and Apple ID auth are recognized for planning only.".to_string(),
+        );
+    }
+    if let Some(path) = &apple_api_key {
+        if !Path::new(path.as_str()).exists() {
             warnings.push(format!(
                 "Configured Apple API key file does not exist: {}.",
-                path.display()
+                path
             ));
         }
     }
-
-    MacosNotarizePlan {
+    Ok(MacosNotarizePlan {
         configured: config.configured,
         enabled: config.enabled,
+        will_execute,
         auth_method,
+        apple_api_key,
+        apple_api_key_id: RedactedSecret::new(config.apple_api_key_id.clone()),
+        apple_api_issuer: RedactedSecret::new(config.apple_api_issuer.clone()),
         keychain_profile: config.keychain_profile.clone(),
         keychain: config.keychain.clone(),
-    }
+        wait,
+        wait_timeout_seconds,
+        staple,
+    })
 }
 
 fn macos_notarize_auth_method(config: &MacosNotarizeConfig) -> Option<String> {
@@ -1236,8 +1425,14 @@ fn macos_notarize_auth_method(config: &MacosNotarizeConfig) -> Option<String> {
     {
         Some("keychain-profile".to_string())
     } else if config.apple_api_key.is_some()
-        && config.apple_api_key_id_set
-        && config.apple_api_issuer_set
+        && config
+            .apple_api_key_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && config
+            .apple_api_issuer
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
     {
         Some("app-store-connect-api-key".to_string())
     } else if config.apple_id_set && config.apple_id_password_set && config.team_id_set {
@@ -2265,10 +2460,12 @@ mod tests {
         assert_eq!(report.signing.macos.sign.gatekeeper_assess, Some(false));
         assert_eq!(report.signing.macos.sign.entitlements.len(), 2);
         assert!(report.signing.macos.notarize.configured);
+        assert!(!report.signing.macos.notarize.will_execute);
         assert_eq!(
             report.signing.macos.notarize.auth_method.as_deref(),
             Some("app-store-connect-api-key")
         );
+        assert!(report.signing.macos.notarize.apple_api_key.is_some());
         assert!(report
             .warnings
             .iter()
@@ -2276,7 +2473,7 @@ mod tests {
         assert!(report
             .warnings
             .iter()
-            .any(|warning| warning.contains("Rust-native notarization is not implemented")));
+            .any(|warning| warning.contains("p12File Developer ID signing")));
 
         let json = serde_json::to_string(&report).expect("report should serialize");
         assert!(!json.contains("SECRET_KEY_ID"));
@@ -2451,10 +2648,15 @@ mod tests {
             report.signing.macos.notarize.auth_method.as_deref(),
             Some("keychain-profile")
         );
+        assert!(!report.signing.macos.notarize.will_execute);
         assert!(!report
             .warnings
             .iter()
             .any(|warning| warning.contains("ad-hoc signing is not notarizable")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("requires appleApiKey")));
 
         let settings = macos_signing_settings(&report).expect("signing settings should build");
         assert!(settings.for_notarization());
@@ -2465,6 +2667,75 @@ mod tests {
 
         let json = serde_json::to_string(&report).expect("report should serialize");
         assert!(!json.contains("P12_PASSWORD="));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plans_macos_native_notarization_execution_with_api_key_auth() {
+        let root = unique_temp_dir("macos-native-notarization-plan");
+        write_package_json(&root);
+        fs::write(root.join("developer-id.p12"), "not a real p12")
+            .expect("p12 placeholder should be written");
+        fs::write(root.join("AuthKey_TEST.p8"), "not a real api key")
+            .expect("api key placeholder should be written");
+        fs::write(
+            root.join("forge.config.js"),
+            r#"
+            module.exports = {
+              packagerConfig: {
+                appBundleId: 'com.example.native-notarized',
+                osxSign: {
+                  p12File: 'developer-id.p12',
+                  p12Password: 'p12-secret',
+                  hardenedRuntime: true,
+                },
+                osxNotarize: {
+                  appleApiKey: 'AuthKey_TEST.p8',
+                  appleApiKeyId: 'SECRET_KEY_ID',
+                  appleApiIssuer: 'SECRET_ISSUER_ID',
+                  maxWaitSeconds: 120,
+                },
+              },
+            };
+            "#,
+        )
+        .expect("forge config should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("darwin".to_string()),
+            arch: Some("arm64".to_string()),
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.signing.macos.sign.for_notarization);
+        assert!(report.signing.macos.notarize.will_execute);
+        assert_eq!(
+            report.signing.macos.notarize.auth_method.as_deref(),
+            Some("app-store-connect-api-key")
+        );
+        assert!(report.signing.macos.notarize.wait);
+        assert_eq!(report.signing.macos.notarize.wait_timeout_seconds, 120);
+        assert!(report.signing.macos.notarize.staple);
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("not implemented")));
+
+        let json = serde_json::to_string(&report).expect("report should serialize");
+        assert!(!json.contains("SECRET_KEY_ID"));
+        assert!(!json.contains("SECRET_ISSUER_ID"));
+        assert!(!json.contains("p12-secret"));
+        assert!(!json.contains("not a real api key"));
 
         let _ = fs::remove_dir_all(root);
     }
