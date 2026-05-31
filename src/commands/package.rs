@@ -58,11 +58,13 @@ struct CopyStep {
 #[derive(Clone, Debug, Serialize)]
 struct PackageMetadata {
     bundle_identifier: String,
+    helper_bundle_identifier: String,
     app_version: Option<String>,
     build_version: Option<String>,
     app_category_type: Option<String>,
     app_copyright: Option<String>,
     extend_info: ExtendInfoPlan,
+    extend_helper_info: ExtendInfoPlan,
     protocols: Vec<MacosProtocolPlan>,
     usage_description: BTreeMap<String, String>,
     icon: Option<IconResource>,
@@ -193,11 +195,13 @@ struct PackagerConfig {
     name: Option<String>,
     executable_name: Option<String>,
     app_bundle_id: Option<String>,
+    helper_bundle_id: Option<String>,
     app_category_type: Option<String>,
     app_version: Option<String>,
     build_version: Option<String>,
     app_copyright: Option<String>,
     extend_info: ExtendInfoConfig,
+    extend_helper_info: ExtendInfoConfig,
     protocols: Vec<MacosProtocolPlan>,
     usage_description: BTreeMap<String, String>,
     icon: Vec<String>,
@@ -271,6 +275,53 @@ struct MacosNotarizeConfig {
 }
 
 struct IgnoreRule(Regex);
+
+#[derive(Clone, Copy)]
+struct MacosHelperSpec {
+    original_basename: &'static str,
+    helper_suffix: &'static str,
+    bundle_identifier_suffix: Option<&'static str>,
+    name_includes_helper_suffix: bool,
+}
+
+const MACOS_HELPER_SPECS: &[MacosHelperSpec] = &[
+    MacosHelperSpec {
+        original_basename: "Electron Helper",
+        helper_suffix: "Helper",
+        bundle_identifier_suffix: None,
+        name_includes_helper_suffix: false,
+    },
+    MacosHelperSpec {
+        original_basename: "Electron Helper EH",
+        helper_suffix: "Helper EH",
+        bundle_identifier_suffix: Some("EH"),
+        name_includes_helper_suffix: true,
+    },
+    MacosHelperSpec {
+        original_basename: "Electron Helper NP",
+        helper_suffix: "Helper NP",
+        bundle_identifier_suffix: Some("NP"),
+        name_includes_helper_suffix: true,
+    },
+    MacosHelperSpec {
+        original_basename: "Electron Helper (Renderer)",
+        helper_suffix: "Helper (Renderer)",
+        bundle_identifier_suffix: None,
+        name_includes_helper_suffix: true,
+    },
+    MacosHelperSpec {
+        original_basename: "Electron Helper (Plugin)",
+        helper_suffix: "Helper (Plugin)",
+        bundle_identifier_suffix: None,
+        name_includes_helper_suffix: true,
+    },
+    MacosHelperSpec {
+        original_basename: "Electron Helper (GPU)",
+        helper_suffix: "Helper (GPU)",
+        bundle_identifier_suffix: None,
+        name_includes_helper_suffix: true,
+    },
+];
 
 pub fn run(args: PackageArgs) -> Result<()> {
     let snapshot = crate::project::inspect(&args.cwd)?;
@@ -492,6 +543,7 @@ pub(crate) fn execute_package(report: &PackageReport, force: bool) -> Result<()>
         )
     })?;
     rename_runtime_executable(bundle_dir, &report.executable_name, &report.platform)?;
+    rename_macos_helpers(bundle_dir, &report.app_name, &report.platform)?;
     apply_package_metadata(report)?;
     copy_package_resources(report)?;
 
@@ -804,6 +856,12 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
     println!("  app name: {}", report.app_name);
     println!("  executable: {}", report.executable_name);
     println!("  bundle id: {}", report.metadata.bundle_identifier);
+    if report.platform == "darwin" {
+        println!(
+            "  helper bundle id: {}",
+            report.metadata.helper_bundle_identifier
+        );
+    }
     if let Some(version) = &report.metadata.app_version {
         println!("  app version: {version}");
     }
@@ -813,6 +871,14 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
         println!(
             "  extend Info.plist: {}",
             report.metadata.extend_info.keys.join(", ")
+        );
+    }
+    if let Some(file) = &report.metadata.extend_helper_info.file {
+        println!("  extend helper Info.plist: {file}");
+    } else if !report.metadata.extend_helper_info.keys.is_empty() {
+        println!(
+            "  extend helper Info.plist: {}",
+            report.metadata.extend_helper_info.keys.join(", ")
         );
     }
     if !report.metadata.protocols.is_empty() {
@@ -1008,11 +1074,13 @@ fn parse_packager_config(value: &JsonValue) -> PackagerConfig {
         name: string_value(value, "name"),
         executable_name: string_value(value, "executableName"),
         app_bundle_id: string_value(value, "appBundleId"),
+        helper_bundle_id: string_value(value, "helperBundleId"),
         app_category_type: string_value(value, "appCategoryType"),
         app_version: string_value(value, "appVersion"),
         build_version: string_value(value, "buildVersion"),
         app_copyright: string_value(value, "appCopyright"),
         extend_info: parse_extend_info_config(value.get("extendInfo")),
+        extend_helper_info: parse_extend_info_config(value.get("extendHelperInfo")),
         protocols: parse_macos_protocols(value.get("protocols")),
         usage_description: string_map(value.get("usageDescription")),
         icon: string_list(value.get("icon")),
@@ -1422,19 +1490,31 @@ fn package_metadata(
         &mut warnings,
     )?;
     let extend_info = resolve_extend_info(root, &config.packager.extend_info, &mut warnings)?;
+    let extend_helper_info =
+        resolve_extend_helper_info(root, &config.packager.extend_helper_info, &mut warnings)?;
     let app_version = config
         .packager
         .app_version
         .clone()
         .or_else(|| config.app_version.clone());
+    let bundle_identifier = config
+        .packager
+        .app_bundle_id
+        .clone()
+        .unwrap_or_else(|| default_bundle_identifier(artifact_name));
+    let helper_bundle_identifier = filter_cfbundle_identifier(
+        config
+            .packager
+            .helper_bundle_id
+            .as_deref()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("{bundle_identifier}.helper")),
+    );
 
     Ok((
         PackageMetadata {
-            bundle_identifier: config
-                .packager
-                .app_bundle_id
-                .clone()
-                .unwrap_or_else(|| default_bundle_identifier(artifact_name)),
+            bundle_identifier,
+            helper_bundle_identifier,
             app_version: app_version.clone(),
             build_version: config
                 .packager
@@ -1444,6 +1524,7 @@ fn package_metadata(
             app_category_type: config.packager.app_category_type.clone(),
             app_copyright: config.packager.app_copyright.clone(),
             extend_info,
+            extend_helper_info,
             protocols: config.packager.protocols.clone(),
             usage_description: config.packager.usage_description.clone(),
             icon,
@@ -1961,9 +2042,27 @@ fn resolve_extend_info(
     extend_info: &ExtendInfoConfig,
     warnings: &mut Vec<String>,
 ) -> Result<ExtendInfoPlan> {
+    resolve_extend_info_with_name(root, extend_info, "extendInfo", warnings)
+}
+
+fn resolve_extend_helper_info(
+    root: &Path,
+    extend_info: &ExtendInfoConfig,
+    warnings: &mut Vec<String>,
+) -> Result<ExtendInfoPlan> {
+    resolve_extend_info_with_name(root, extend_info, "extendHelperInfo", warnings)
+}
+
+fn resolve_extend_info_with_name(
+    root: &Path,
+    extend_info: &ExtendInfoConfig,
+    option_name: &str,
+    warnings: &mut Vec<String>,
+) -> Result<ExtendInfoPlan> {
     if extend_info.invalid_type {
-        warnings
-            .push("packagerConfig.extendInfo must be a plist file path or an object.".to_string());
+        warnings.push(format!(
+            "packagerConfig.{option_name} must be a plist file path or an object."
+        ));
     }
 
     let file = extend_info
@@ -1975,7 +2074,7 @@ fn resolve_extend_info(
     if let Some(path) = &file {
         if !Path::new(path.as_str()).exists() {
             warnings.push(format!(
-                "Configured extendInfo plist does not exist and packaging will fail: {}.",
+                "Configured {option_name} plist does not exist and packaging will fail: {}.",
                 path
             ));
         }
@@ -2016,6 +2115,14 @@ fn default_bundle_identifier(artifact_name: &str) -> String {
         component
     };
     format!("com.electron.{component}")
+}
+
+fn filter_cfbundle_identifier(identifier: String) -> String {
+    identifier
+        .replace(' ', "-")
+        .chars()
+        .filter(|char| char.is_ascii_alphanumeric() || matches!(char, '.' | '-'))
+        .collect()
 }
 
 fn copy_project_files(
@@ -2830,17 +2937,12 @@ fn apply_macos_metadata(report: &PackageReport) -> Result<()> {
     let bundle_dir = Path::new(report.bundle_dir.as_str());
     let info_plist_path = bundle_dir.join("Contents/Info.plist");
     let mut dictionary = if info_plist_path.exists() {
-        match PlistValue::from_file(&info_plist_path)
-            .with_context(|| format!("Could not read {}", info_plist_path.display()))?
-        {
-            PlistValue::Dictionary(dictionary) => dictionary,
-            _ => bail!("{} is not a plist dictionary", info_plist_path.display()),
-        }
+        read_plist_dictionary(&info_plist_path)?
     } else {
         PlistDictionary::new()
     };
 
-    apply_extend_info(&mut dictionary, &report.metadata.extend_info)?;
+    apply_extend_info(&mut dictionary, &report.metadata.extend_info, "extendInfo")?;
 
     set_plist_string(&mut dictionary, "CFBundleName", &report.app_name);
     set_plist_string(&mut dictionary, "CFBundleDisplayName", &report.app_name);
@@ -2902,26 +3004,183 @@ fn apply_macos_metadata(report: &PackageReport) -> Result<()> {
         );
     }
 
-    if let Some(parent) = info_plist_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Could not create {}", parent.display()))?;
-    }
-    PlistValue::Dictionary(dictionary)
-        .to_file_xml(&info_plist_path)
-        .with_context(|| format!("Could not write {}", info_plist_path.display()))?;
+    write_plist_dictionary(&info_plist_path, dictionary)?;
+    apply_macos_helper_metadata(report)?;
 
     Ok(())
 }
 
-fn apply_extend_info(dictionary: &mut PlistDictionary, extend_info: &ExtendInfoPlan) -> Result<()> {
+fn apply_macos_helper_metadata(report: &PackageReport) -> Result<()> {
+    let bundle_dir = Path::new(report.bundle_dir.as_str());
+    let frameworks_dir = bundle_dir.join("Contents/Frameworks");
+
+    for spec in MACOS_HELPER_SPECS {
+        let helper_paths = macos_helper_info_plist_paths(&frameworks_dir, &report.app_name, spec);
+        for info_plist_path in helper_paths {
+            if !info_plist_path.exists() {
+                continue;
+            }
+
+            let mut dictionary = read_plist_dictionary(&info_plist_path)?;
+            apply_extend_info(
+                &mut dictionary,
+                &report.metadata.extend_helper_info,
+                "extendHelperInfo",
+            )?;
+
+            let display_name = format!("{} {}", report.app_name, spec.helper_suffix);
+            let bundle_identifier =
+                macos_helper_bundle_identifier(&report.metadata.helper_bundle_identifier, spec);
+            let name = if spec.name_includes_helper_suffix {
+                display_name.as_str()
+            } else {
+                report.app_name.as_str()
+            };
+
+            set_plist_string(&mut dictionary, "CFBundleDisplayName", &display_name);
+            set_plist_string(
+                &mut dictionary,
+                "CFBundleExecutable",
+                &sanitize_macos_file_name(&display_name),
+            );
+            set_plist_string(&mut dictionary, "CFBundleIdentifier", &bundle_identifier);
+            set_plist_string(
+                &mut dictionary,
+                "CFBundleName",
+                &sanitize_macos_file_name(name),
+            );
+
+            apply_macos_shared_version_and_usage_metadata(report, &mut dictionary);
+            write_plist_dictionary(&info_plist_path, dictionary)?;
+        }
+    }
+
+    apply_macos_login_helper_metadata(report)?;
+
+    Ok(())
+}
+
+fn apply_macos_login_helper_metadata(report: &PackageReport) -> Result<()> {
+    let bundle_dir = Path::new(report.bundle_dir.as_str());
+    let login_items_dir = bundle_dir.join("Contents/Library/LoginItems");
+    let app_file_name = sanitize_macos_file_name(&report.app_name);
+    let helper_name = format!("{app_file_name} Login Helper");
+    let paths = [
+        login_items_dir
+            .join(format!("{helper_name}.app"))
+            .join("Contents/Info.plist"),
+        login_items_dir
+            .join("Electron Login Helper.app")
+            .join("Contents/Info.plist"),
+    ];
+
+    for info_plist_path in paths {
+        if !info_plist_path.exists() {
+            continue;
+        }
+
+        let mut dictionary = read_plist_dictionary(&info_plist_path)?;
+        set_plist_string(&mut dictionary, "CFBundleExecutable", &helper_name);
+        set_plist_string(
+            &mut dictionary,
+            "CFBundleIdentifier",
+            &format!("{}.loginhelper", report.metadata.bundle_identifier),
+        );
+        set_plist_string(&mut dictionary, "CFBundleName", &helper_name);
+        write_plist_dictionary(&info_plist_path, dictionary)?;
+    }
+
+    Ok(())
+}
+
+fn macos_helper_info_plist_paths(
+    frameworks_dir: &Path,
+    app_name: &str,
+    spec: &MacosHelperSpec,
+) -> Vec<PathBuf> {
+    let renamed_basename = format!(
+        "{} {}",
+        sanitize_macos_file_name(app_name),
+        spec.helper_suffix
+    );
+    let original_path = frameworks_dir
+        .join(format!("{}.app", spec.original_basename))
+        .join("Contents/Info.plist");
+    let renamed_path = frameworks_dir
+        .join(format!("{renamed_basename}.app"))
+        .join("Contents/Info.plist");
+
+    if renamed_path == original_path {
+        vec![renamed_path]
+    } else {
+        vec![renamed_path, original_path]
+    }
+}
+
+fn macos_helper_bundle_identifier(
+    helper_bundle_identifier: &str,
+    spec: &MacosHelperSpec,
+) -> String {
+    match spec.bundle_identifier_suffix {
+        Some(suffix) => format!("{helper_bundle_identifier}.{suffix}"),
+        None => helper_bundle_identifier.to_string(),
+    }
+}
+
+fn apply_macos_shared_version_and_usage_metadata(
+    report: &PackageReport,
+    dictionary: &mut PlistDictionary,
+) {
+    if let Some(version) = &report.metadata.app_version {
+        set_plist_string(dictionary, "CFBundleShortVersionString", version);
+    }
+    if let Some(version) = &report.metadata.build_version {
+        set_plist_string(dictionary, "CFBundleVersion", version);
+    }
+    for (usage_type, description) in &report.metadata.usage_description {
+        set_plist_string(
+            dictionary,
+            &format!("NS{usage_type}UsageDescription"),
+            description,
+        );
+    }
+}
+
+fn read_plist_dictionary(path: &Path) -> Result<PlistDictionary> {
+    match PlistValue::from_file(path)
+        .with_context(|| format!("Could not read {}", path.display()))?
+    {
+        PlistValue::Dictionary(dictionary) => Ok(dictionary),
+        _ => bail!("{} is not a plist dictionary", path.display()),
+    }
+}
+
+fn write_plist_dictionary(path: &Path, dictionary: PlistDictionary) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create {}", parent.display()))?;
+    }
+    PlistValue::Dictionary(dictionary)
+        .to_file_xml(path)
+        .with_context(|| format!("Could not write {}", path.display()))
+}
+
+fn apply_extend_info(
+    dictionary: &mut PlistDictionary,
+    extend_info: &ExtendInfoPlan,
+    option_name: &str,
+) -> Result<()> {
     merge_plist_dictionary(dictionary, extend_info.values.clone());
 
     if let Some(file) = &extend_info.file {
         let file = Path::new(file.as_str());
         let value = PlistValue::from_file(file)
-            .with_context(|| format!("Could not read extendInfo plist {}", file.display()))?;
+            .with_context(|| format!("Could not read {option_name} plist {}", file.display()))?;
         let PlistValue::Dictionary(extend_dictionary) = value else {
-            bail!("extendInfo plist is not a dictionary: {}", file.display());
+            bail!(
+                "{option_name} plist is not a dictionary: {}",
+                file.display()
+            );
         };
         merge_plist_dictionary(dictionary, extend_dictionary);
     }
@@ -3270,6 +3529,70 @@ fn rename_runtime_executable(
     Ok(())
 }
 
+fn rename_macos_helpers(bundle_dir: &Path, app_name: &str, platform: &str) -> Result<()> {
+    if platform != "darwin" {
+        return Ok(());
+    }
+
+    let frameworks_dir = bundle_dir.join("Contents/Frameworks");
+    let app_file_name = sanitize_macos_file_name(app_name);
+    for spec in MACOS_HELPER_SPECS {
+        rename_macos_helper(
+            &frameworks_dir,
+            spec.original_basename,
+            &format!("{} {}", app_file_name, spec.helper_suffix),
+        )?;
+    }
+
+    let login_items_dir = bundle_dir.join("Contents/Library/LoginItems");
+    if login_items_dir.exists() {
+        rename_macos_helper(
+            &login_items_dir,
+            "Electron Login Helper",
+            &format!("{app_file_name} Login Helper"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn rename_macos_helper(
+    helper_dir: &Path,
+    original_basename: &str,
+    new_basename: &str,
+) -> Result<()> {
+    let original_app = helper_dir.join(format!("{original_basename}.app"));
+    if !original_app.exists() {
+        return Ok(());
+    }
+
+    let executable_dir = original_app.join("Contents/MacOS");
+    let original_executable = executable_dir.join(original_basename);
+    let new_executable = executable_dir.join(new_basename);
+    if original_executable.exists() && original_executable != new_executable {
+        fs::rename(&original_executable, &new_executable).with_context(|| {
+            format!(
+                "Could not rename {} to {}",
+                original_executable.display(),
+                new_executable.display()
+            )
+        })?;
+    }
+
+    let new_app = helper_dir.join(format!("{new_basename}.app"));
+    if original_app != new_app {
+        fs::rename(&original_app, &new_app).with_context(|| {
+            format!(
+                "Could not rename {} to {}",
+                original_app.display(),
+                new_app.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 fn resolve_output_dir(root: &Path, out_dir: &Path) -> PathBuf {
     if out_dir.is_absolute() {
         out_dir.to_path_buf()
@@ -3339,6 +3662,27 @@ fn clean_app_name(name: &str) -> String {
         "electron-app".to_string()
     } else {
         cleaned
+    }
+}
+
+fn sanitize_macos_file_name(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|char| {
+            if char.is_ascii_alphanumeric() || matches!(char, ' ' | '-' | '_' | '.' | '(' | ')') {
+                char
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches([' ', '-', '.', '_'])
+        .to_string();
+
+    if sanitized.is_empty() {
+        "electron-app".to_string()
+    } else {
+        sanitized
     }
 }
 
@@ -3419,6 +3763,9 @@ impl PackagerConfig {
             .executable_name
             .or_else(|| self.executable_name.take());
         self.app_bundle_id = other.app_bundle_id.or_else(|| self.app_bundle_id.take());
+        self.helper_bundle_id = other
+            .helper_bundle_id
+            .or_else(|| self.helper_bundle_id.take());
         self.app_category_type = other
             .app_category_type
             .or_else(|| self.app_category_type.take());
@@ -3427,6 +3774,9 @@ impl PackagerConfig {
         self.app_copyright = other.app_copyright.or_else(|| self.app_copyright.take());
         if other.extend_info.configured {
             self.extend_info = other.extend_info;
+        }
+        if other.extend_helper_info.configured {
+            self.extend_helper_info = other.extend_helper_info;
         }
         if !other.protocols.is_empty() {
             self.protocols = other.protocols;
@@ -4279,6 +4629,168 @@ mod tests {
     }
 
     #[test]
+    fn applies_macos_helper_metadata_and_extend_helper_info() {
+        let root = unique_temp_dir("macos-helper-info-plist-metadata");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name": "starter-app",
+                "productName": "Starter Pro",
+                "version": "2.3.4",
+                "main": "src/main.js",
+                "devDependencies": {
+                    "electron": "30.0.0"
+                },
+                "electronCli": {
+                    "packagerConfig": {
+                        "appBundleId": "com.example.starter",
+                        "helperBundleId": "com.example.custom helper!",
+                        "extendHelperInfo": {
+                            "CFBundleIdentifier": "com.example.from-extend-helper-info",
+                            "LSBackgroundOnly": true
+                        },
+                        "usageDescription": {
+                            "Camera": "Needed for video calls"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_macos_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("darwin".to_string()),
+            arch: Some(current_arch()),
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+        let bundle_dir = Path::new(report.bundle_dir.as_str());
+        fs::create_dir_all(bundle_dir.join("Contents")).expect("bundle contents should be created");
+
+        let base_helper =
+            bundle_dir.join("Contents/Frameworks/Electron Helper.app/Contents/Info.plist");
+        let renderer_helper = bundle_dir
+            .join("Contents/Frameworks/Electron Helper (Renderer).app/Contents/Info.plist");
+        let eh_helper =
+            bundle_dir.join("Contents/Frameworks/Electron Helper EH.app/Contents/Info.plist");
+        write_macos_helper_info_plist(&base_helper);
+        write_macos_helper_info_plist(&renderer_helper);
+        write_macos_helper_info_plist(&eh_helper);
+
+        assert_eq!(
+            report.metadata.helper_bundle_identifier,
+            "com.example.custom-helper"
+        );
+        assert!(report
+            .metadata
+            .extend_helper_info
+            .keys
+            .contains(&"CFBundleIdentifier".to_string()));
+        assert!(report
+            .metadata
+            .extend_helper_info
+            .keys
+            .contains(&"LSBackgroundOnly".to_string()));
+
+        apply_macos_metadata(&report).expect("metadata should apply");
+
+        let base = read_plist_dictionary(&base_helper).expect("base helper plist should read");
+        assert_eq!(
+            plist_string(&base, "CFBundleDisplayName"),
+            Some("Starter Pro Helper")
+        );
+        assert_eq!(
+            plist_string(&base, "CFBundleExecutable"),
+            Some("Starter Pro Helper")
+        );
+        assert_eq!(
+            plist_string(&base, "CFBundleIdentifier"),
+            Some("com.example.custom-helper")
+        );
+        assert_eq!(plist_string(&base, "CFBundleName"), Some("Starter Pro"));
+        assert_eq!(plist_bool(&base, "LSBackgroundOnly"), Some(true));
+        assert_eq!(
+            plist_string(&base, "CFBundleShortVersionString"),
+            Some("2.3.4")
+        );
+        assert_eq!(plist_string(&base, "CFBundleVersion"), Some("2.3.4"));
+        assert_eq!(
+            plist_string(&base, "NSCameraUsageDescription"),
+            Some("Needed for video calls")
+        );
+
+        let renderer =
+            read_plist_dictionary(&renderer_helper).expect("renderer helper plist should read");
+        assert_eq!(
+            plist_string(&renderer, "CFBundleDisplayName"),
+            Some("Starter Pro Helper (Renderer)")
+        );
+        assert_eq!(
+            plist_string(&renderer, "CFBundleIdentifier"),
+            Some("com.example.custom-helper")
+        );
+        assert_eq!(
+            plist_string(&renderer, "CFBundleName"),
+            Some("Starter Pro Helper (Renderer)")
+        );
+
+        let eh = read_plist_dictionary(&eh_helper).expect("EH helper plist should read");
+        assert_eq!(
+            plist_string(&eh, "CFBundleIdentifier"),
+            Some("com.example.custom-helper.EH")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn renames_macos_helper_apps_and_executables() {
+        let root = unique_temp_dir("macos-helper-renames");
+        let bundle_dir = root.join("Starter Pro.app");
+        let frameworks_dir = bundle_dir.join("Contents/Frameworks");
+        let base_executable_dir = frameworks_dir.join("Electron Helper.app/Contents/MacOS");
+        let renderer_executable_dir =
+            frameworks_dir.join("Electron Helper (Renderer).app/Contents/MacOS");
+        fs::create_dir_all(&base_executable_dir).expect("base helper should be created");
+        fs::create_dir_all(&renderer_executable_dir).expect("renderer helper should be created");
+        fs::write(base_executable_dir.join("Electron Helper"), "")
+            .expect("base helper executable should be written");
+        fs::write(
+            renderer_executable_dir.join("Electron Helper (Renderer)"),
+            "",
+        )
+        .expect("renderer helper executable should be written");
+
+        rename_macos_helpers(&bundle_dir, "Starter Pro", "darwin")
+            .expect("helpers should be renamed");
+
+        assert!(!frameworks_dir.join("Electron Helper.app").exists());
+        assert!(frameworks_dir.join("Starter Pro Helper.app").exists());
+        assert!(frameworks_dir
+            .join("Starter Pro Helper.app/Contents/MacOS/Starter Pro Helper")
+            .exists());
+        assert!(!frameworks_dir
+            .join("Electron Helper (Renderer).app")
+            .exists());
+        assert!(frameworks_dir
+            .join("Starter Pro Helper (Renderer).app")
+            .exists());
+        assert!(frameworks_dir
+            .join("Starter Pro Helper (Renderer).app/Contents/MacOS/Starter Pro Helper (Renderer)")
+            .exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn plans_packager_metadata_from_forge_config_js() {
         let root = unique_temp_dir("forge-config-metadata");
         write_package_json(&root);
@@ -5118,6 +5630,15 @@ mod tests {
             panic!("Info.plist should be a dictionary");
         };
         dictionary
+    }
+
+    fn write_macos_helper_info_plist(path: &Path) {
+        let mut dictionary = PlistDictionary::new();
+        dictionary.insert(
+            "CFBundleIdentifier".to_string(),
+            PlistValue::String("com.electron.helper".to_string()),
+        );
+        write_plist_dictionary(path, dictionary).expect("helper Info.plist should be written");
     }
 
     fn write_fake_electron_dist(root: &Path) {
