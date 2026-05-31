@@ -37,9 +37,9 @@ The Rust-native flow currently owns:
 - `start`: launches the installed Electron runtime directly.
 - `package`: copies the installed Electron runtime, app files, installed production dependency closure, app metadata, macOS icon, and extra resources into a local app bundle for the current platform and architecture.
 - `make`: runs `package` and writes distributables under `out/make/<target>/<platform>/<arch>/`; it reads JSON-shaped `config.forge.makers` / `electronCli.makers` arrays when `--target` is omitted, and `--target` still forces one maker. ZIP works on all platforms, `--target dmg` writes a basic macOS disk image, `--target deb` / `--target rpm` write Linux packages, and `--target msi` writes a basic Windows Installer package.
-- `publish`: runs `make` and publishes the distributable to a local directory with a manifest or to GitHub Releases.
+- `publish`: runs `make` and publishes distributables to a local directory with a manifest or to GitHub Releases; it reads JSON-shaped `config.forge.publishers` / `electronCli.publishers` arrays when `--publisher` is omitted, and `--publisher` still forces one publisher.
 
-The GitHub publisher creates or reuses a release, uploads the selected make artifact, and can replace an existing asset with `--force`. It reads `GITHUB_TOKEN` or `GH_TOKEN` and can infer `OWNER/REPO` from `package.json` `repository`, or you can pass `--github-repo`.
+The GitHub publisher creates or reuses a release, uploads selected make artifacts, and can replace an existing asset with `--force`. It reads `GITHUB_TOKEN` or `GH_TOKEN` and can infer `OWNER/REPO` from package metadata, Forge GitHub publisher config, or `package.json` `repository`. You can also pass `--github-repo`.
 
 The DMG maker is currently a pure-Rust FAT32 image with the app bundle and an Applications entry. The MSI maker writes a compressed embedded CAB, Windows Installer database tables, and a Start Menu shortcut when the packaged executable is present. HFS+/APFS DMG layout customization, installer UI customization, Windows/Linux icon embedding, signing, and notarization are still TODO.
 
@@ -61,19 +61,33 @@ Package metadata can be configured in `package.json`:
       { "name": "@electron-forge/maker-deb", "platforms": ["linux"] },
       { "name": "@electron-forge/maker-rpm", "platforms": ["linux"] },
       { "name": "@electron-forge/maker-wix", "platforms": ["win32"] }
+    ],
+    "publishers": [
+      { "name": "local", "config": { "to": "out/publish/local", "channel": "alpha" } },
+      {
+        "name": "@electron-forge/publisher-github",
+        "config": {
+          "repository": { "owner": "example", "name": "my-app" },
+          "draft": true,
+          "prerelease": true
+        }
+      }
     ]
   },
   "config": {
     "forge": {
       "makers": [
         { "name": "@electron-forge/maker-zip" }
+      ],
+      "publishers": [
+        { "name": "@electron-forge/publisher-github" }
       ]
     }
   }
 }
 ```
 
-The package command also reads JSON-shaped `config.forge.packagerConfig` and `electronPackagerConfig` entries for the same fields. The make command maps JSON-shaped Forge maker names to the Rust-native targets it supports: zip, dmg, deb, rpm, and wix/msi. JavaScript Forge config files are not evaluated.
+The package command also reads JSON-shaped `config.forge.packagerConfig` and `electronPackagerConfig` entries for the same fields. The make command maps JSON-shaped Forge maker names to the Rust-native targets it supports: zip, dmg, deb, rpm, and wix/msi. The publish command maps JSON-shaped publisher names to local and GitHub. JavaScript Forge config files are not evaluated.
 
 ## Install
 
@@ -139,7 +153,7 @@ The inspection and planning commands support `--json` so agents and scripts can 
 `start --dry-run --json` shows the Electron executable that will be launched.
 `package --dry-run --json` shows the runtime, app file, metadata, icon, and extra-resource copy plan.
 `make --dry-run --json` shows the package prerequisite and selected maker artifact path.
-`publish --dry-run --json` shows the make prerequisite plus either the local destination/manifest path or the GitHub release/upload plan.
+`publish --dry-run --json` shows the make prerequisite plus either the local destination/manifest path or the GitHub release/upload plan. When multiple configured makers or publishers apply, the JSON output contains a `publishes` array.
 
 ```sh
 electron-cli plan --json

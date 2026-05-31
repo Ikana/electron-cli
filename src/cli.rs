@@ -207,17 +207,17 @@ pub struct PublishArgs {
     #[arg(long)]
     pub arch: Option<String>,
 
-    /// Maker target whose artifact should be published.
-    #[arg(long, value_enum, default_value_t = MakeTarget::Zip)]
-    pub target: MakeTarget,
+    /// Maker target whose artifact should be published. Overrides configured makers when provided.
+    #[arg(long, value_enum)]
+    pub target: Option<MakeTarget>,
 
-    /// Publisher target to use.
-    #[arg(long, value_enum, default_value_t = PublishTarget::Local)]
-    pub publisher: PublishTarget,
+    /// Publisher target to use. Overrides configured publishers when provided.
+    #[arg(long, value_enum)]
+    pub publisher: Option<PublishTarget>,
 
     /// Destination for local published artifacts.
-    #[arg(long, default_value = "out/publish/local", value_name = "PATH")]
-    pub to: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    pub to: Option<PathBuf>,
 
     /// GitHub repository to publish to, in OWNER/REPO form.
     #[arg(long, value_name = "OWNER/REPO")]
@@ -240,12 +240,12 @@ pub struct PublishArgs {
     pub github_prerelease: bool,
 
     /// GitHub API base URL, useful for GitHub Enterprise.
-    #[arg(long, default_value = "https://api.github.com", value_name = "URL")]
-    pub github_api_url: String,
+    #[arg(long, value_name = "URL")]
+    pub github_api_url: Option<String>,
 
     /// Release channel label written into the publish manifest.
-    #[arg(long, default_value = "default")]
-    pub channel: String,
+    #[arg(long)]
+    pub channel: Option<String>,
 
     /// Reuse an existing make artifact instead of running package and make first.
     #[arg(long)]
@@ -306,7 +306,7 @@ impl MakeTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum PublishTarget {
     Github,

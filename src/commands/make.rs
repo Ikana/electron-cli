@@ -27,7 +27,7 @@ use crate::{
     project::ProjectSnapshot,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct MakeReport {
     package: PackageReport,
     target: String,
@@ -74,6 +74,7 @@ pub fn run(args: MakeArgs) -> Result<()> {
     print_reports(&reports, args.json, MakeStatus::Made)
 }
 
+#[cfg(test)]
 pub(crate) fn build_report(args: &MakeArgs) -> Result<MakeReport> {
     let reports = build_reports(args)?;
     if reports.len() != 1 {
@@ -345,6 +346,7 @@ fn current_platform_label() -> String {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn execute_make(report: &mut MakeReport, args: &MakeArgs) -> Result<()> {
     ensure_package_ready(std::slice::from_mut(report), args)?;
     execute_make_artifact(report, args)?;

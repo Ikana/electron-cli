@@ -12,7 +12,7 @@ use serde_json::Value as JsonValue;
 
 use crate::{cli::PackageArgs, output, project::ProjectSnapshot};
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct PackageReport {
     project: ProjectSnapshot,
     app_name: String,
@@ -31,13 +31,13 @@ pub(crate) struct PackageReport {
     warnings: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct CopyStep {
     from: Utf8PathBuf,
     to: Utf8PathBuf,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct PackageMetadata {
     bundle_identifier: String,
     app_version: Option<String>,
@@ -49,13 +49,13 @@ struct PackageMetadata {
     darwin_dark_mode_support: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct IconResource {
     from: Utf8PathBuf,
     to: Utf8PathBuf,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum PackageStatus {
     Planned,
