@@ -36,7 +36,7 @@ The Rust-native flow currently owns:
 - `init --template minimal`: writes a local Electron starter without Electron Forge.
 - `start`: launches the installed Electron runtime directly.
 - `package`: copies the installed Electron runtime, app files, installed production dependency closure, app metadata, macOS icon, and extra resources into a local app bundle for the current platform and architecture.
-- `make`: runs `package` and writes a distributable under `out/make/<target>/<platform>/<arch>/`; ZIP works on all platforms, `--target dmg` writes a basic macOS disk image, `--target deb` / `--target rpm` write Linux packages, and `--target msi` writes a basic Windows Installer package.
+- `make`: runs `package` and writes distributables under `out/make/<target>/<platform>/<arch>/`; it reads JSON-shaped `config.forge.makers` / `electronCli.makers` arrays when `--target` is omitted, and `--target` still forces one maker. ZIP works on all platforms, `--target dmg` writes a basic macOS disk image, `--target deb` / `--target rpm` write Linux packages, and `--target msi` writes a basic Windows Installer package.
 - `publish`: runs `make` and publishes the distributable to a local directory with a manifest or to GitHub Releases.
 
 The GitHub publisher creates or reuses a release, uploads the selected make artifact, and can replace an existing asset with `--force`. It reads `GITHUB_TOKEN` or `GH_TOKEN` and can infer `OWNER/REPO` from `package.json` `repository`, or you can pass `--github-repo`.
@@ -54,12 +54,26 @@ Package metadata can be configured in `package.json`:
       "appCategoryType": "public.app-category.developer-tools",
       "icon": "assets/icon",
       "extraResource": "assets/config.json"
+    },
+    "makers": [
+      { "name": "@electron-forge/maker-zip" },
+      { "name": "@electron-forge/maker-dmg", "platforms": ["darwin"] },
+      { "name": "@electron-forge/maker-deb", "platforms": ["linux"] },
+      { "name": "@electron-forge/maker-rpm", "platforms": ["linux"] },
+      { "name": "@electron-forge/maker-wix", "platforms": ["win32"] }
+    ]
+  },
+  "config": {
+    "forge": {
+      "makers": [
+        { "name": "@electron-forge/maker-zip" }
+      ]
     }
   }
 }
 ```
 
-The package command also reads JSON-shaped `config.forge.packagerConfig` and `electronPackagerConfig` entries for the same fields. JavaScript Forge config files are not evaluated.
+The package command also reads JSON-shaped `config.forge.packagerConfig` and `electronPackagerConfig` entries for the same fields. The make command maps JSON-shaped Forge maker names to the Rust-native targets it supports: zip, dmg, deb, rpm, and wix/msi. JavaScript Forge config files are not evaluated.
 
 ## Install
 

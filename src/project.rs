@@ -9,7 +9,7 @@ use camino::Utf8PathBuf;
 use serde::Serialize;
 use serde_json::Value;
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ProjectSnapshot {
     pub root: Utf8PathBuf,
     pub package_json: Option<Utf8PathBuf>,

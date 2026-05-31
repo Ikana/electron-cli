@@ -164,9 +164,9 @@ pub struct MakeArgs {
     #[arg(long)]
     pub arch: Option<String>,
 
-    /// Maker target to run.
-    #[arg(long, value_enum, default_value_t = MakeTarget::Zip)]
-    pub target: MakeTarget,
+    /// Maker target to run. Overrides configured makers when provided.
+    #[arg(long, value_enum)]
+    pub target: Option<MakeTarget>,
 
     /// Reuse an existing package output instead of running package first.
     #[arg(long)]

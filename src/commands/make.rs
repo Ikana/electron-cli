@@ -15,6 +15,7 @@ use fscommon::BufStream;
 use msi::{Column, Insert, Language, Package, PackageType, Value};
 use rpm::{BuildConfig, CompressionType, FileOptions, PackageBuilder};
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 use tar::{Builder as TarBuilder, Header as TarHeader};
 use uuid::Uuid;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
@@ -23,12 +24,15 @@ use crate::{
     cli::{MakeArgs, MakeTarget, PackageArgs},
     commands::package::{self, PackageReport},
     output,
+    project::ProjectSnapshot,
 };
 
 #[derive(Debug, Serialize)]
 pub(crate) struct MakeReport {
     package: PackageReport,
     target: String,
+    #[serde(skip)]
+    target_kind: MakeTarget,
     skip_package: bool,
     dry_run: bool,
     make_dir: Utf8PathBuf,
@@ -38,27 +42,53 @@ pub(crate) struct MakeReport {
     warnings: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum MakeStatus {
     Planned,
     Made,
 }
 
+struct ResolvedMakeTargets {
+    targets: Vec<MakeTarget>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MakeRunReport<'a> {
+    targets: &'a [MakeReport],
+    dry_run: bool,
+    status: MakeStatus,
+    warnings: Vec<String>,
+}
+
 pub fn run(args: MakeArgs) -> Result<()> {
-    let mut report = build_report(&args)?;
+    let mut reports = build_reports(&args)?;
 
     if args.dry_run {
-        return print_report(&report, args.json);
+        return print_reports(&reports, args.json, MakeStatus::Planned);
     }
 
-    execute_make(&mut report, &args)?;
-    report.mark_made()?;
+    execute_make_reports(&mut reports, &args)?;
 
-    print_report(&report, args.json)
+    print_reports(&reports, args.json, MakeStatus::Made)
 }
 
 pub(crate) fn build_report(args: &MakeArgs) -> Result<MakeReport> {
+    let reports = build_reports(args)?;
+    if reports.len() != 1 {
+        bail!(
+            "Expected one make target, but resolved {}. Pass --target to select one target.",
+            reports.len()
+        );
+    }
+    Ok(reports
+        .into_iter()
+        .next()
+        .expect("length was checked above"))
+}
+
+pub(crate) fn build_reports(args: &MakeArgs) -> Result<Vec<MakeReport>> {
     let package_args = PackageArgs {
         cwd: args.cwd.clone(),
         out_dir: args.out_dir.clone(),
@@ -70,29 +100,47 @@ pub(crate) fn build_report(args: &MakeArgs) -> Result<MakeReport> {
         json: false,
     };
     let snapshot = crate::project::inspect(&package_args.cwd)?;
-    let package = package::build_report(snapshot, &package_args)?;
+    let resolved = resolve_make_targets(&snapshot, args)?;
+    let config_warnings = resolved.warnings;
+    resolved
+        .targets
+        .into_iter()
+        .map(|target| {
+            let package = package::build_report(snapshot.clone(), &package_args)?;
+            build_report_for_target(package, target, args, &config_warnings)
+        })
+        .collect()
+}
+
+fn build_report_for_target(
+    package: PackageReport,
+    target: MakeTarget,
+    args: &MakeArgs,
+    config_warnings: &[String],
+) -> Result<MakeReport> {
     let make_dir = Path::new(package.output_dir().as_str())
         .join("make")
-        .join(args.target.as_str())
+        .join(target.as_str())
         .join(package.platform())
         .join(package.arch());
-    let artifact = make_artifact_path(&make_dir, &package, args.target);
+    let artifact = make_artifact_path(&make_dir, &package, target);
 
     let mut warnings = package.warnings().to_vec();
-    if matches!(args.target, MakeTarget::Deb | MakeTarget::Rpm) && package.platform() != "linux" {
+    warnings.extend(config_warnings.iter().cloned());
+    if matches!(target, MakeTarget::Deb | MakeTarget::Rpm) && package.platform() != "linux" {
         warnings.push(format!(
             "{} maker only supports linux packages; target platform is {}.",
-            args.target.as_str(),
+            target.as_str(),
             package.platform()
         ));
     }
-    if args.target == MakeTarget::Dmg && package.platform() != "darwin" {
+    if target == MakeTarget::Dmg && package.platform() != "darwin" {
         warnings.push(format!(
             "dmg maker only supports macOS packages; target platform is {}.",
             package.platform()
         ));
     }
-    if args.target == MakeTarget::Msi && package.platform() != "win32" {
+    if target == MakeTarget::Msi && package.platform() != "win32" {
         warnings.push(format!(
             "msi maker only supports Windows packages; target platform is {}.",
             package.platform()
@@ -114,7 +162,8 @@ pub(crate) fn build_report(args: &MakeArgs) -> Result<MakeReport> {
 
     Ok(MakeReport {
         package,
-        target: args.target.as_str().to_string(),
+        target: target.as_str().to_string(),
+        target_kind: target,
         skip_package: args.skip_package,
         dry_run: args.dry_run,
         make_dir: utf8_path(make_dir)?,
@@ -125,17 +174,215 @@ pub(crate) fn build_report(args: &MakeArgs) -> Result<MakeReport> {
     })
 }
 
+struct ConfiguredMaker {
+    label: String,
+    target: Option<MakeTarget>,
+    platforms: Vec<String>,
+}
+
+fn resolve_make_targets(
+    snapshot: &ProjectSnapshot,
+    args: &MakeArgs,
+) -> Result<ResolvedMakeTargets> {
+    if let Some(target) = args.target {
+        return Ok(ResolvedMakeTargets {
+            targets: vec![target],
+            warnings: Vec::new(),
+        });
+    }
+
+    let platform = args.platform.clone().unwrap_or_else(current_platform_label);
+    let makers = configured_makers(snapshot)?;
+    let mut warnings = Vec::new();
+    let mut targets = Vec::new();
+
+    for maker in &makers {
+        let Some(target) = maker.target else {
+            warnings.push(format!(
+                "Configured maker is not implemented yet and will be skipped: {}.",
+                maker.label
+            ));
+            continue;
+        };
+        if !maker_applies_to_platform(maker, &platform) {
+            continue;
+        }
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+
+    if targets.is_empty() {
+        if makers.is_empty() {
+            targets.push(MakeTarget::Zip);
+        } else {
+            warnings.push(format!(
+                "No supported configured makers apply to {platform}; defaulting to zip. Pass --target to override."
+            ));
+            targets.push(MakeTarget::Zip);
+        }
+    }
+
+    Ok(ResolvedMakeTargets { targets, warnings })
+}
+
+fn configured_makers(snapshot: &ProjectSnapshot) -> Result<Vec<ConfiguredMaker>> {
+    let Some(package_json_path) = &snapshot.package_json else {
+        return Ok(Vec::new());
+    };
+    let package_json_path = Path::new(package_json_path.as_str());
+    let raw = fs::read_to_string(package_json_path)
+        .with_context(|| format!("Could not read {}", package_json_path.display()))?;
+    let package = serde_json::from_str::<JsonValue>(&raw)
+        .with_context(|| format!("Could not parse {}", package_json_path.display()))?;
+
+    let mut makers = Vec::new();
+    for value in [
+        package
+            .get("config")
+            .and_then(|config| config.get("forge"))
+            .and_then(|forge| forge.get("makers")),
+        package
+            .get("electronCli")
+            .or_else(|| package.get("electron-cli"))
+            .and_then(|config| config.get("makers")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        makers.extend(parse_maker_list(value));
+    }
+
+    Ok(makers)
+}
+
+fn parse_maker_list(value: &JsonValue) -> Vec<ConfiguredMaker> {
+    match value {
+        JsonValue::Array(values) => values.iter().filter_map(parse_maker).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_maker(value: &JsonValue) -> Option<ConfiguredMaker> {
+    match value {
+        JsonValue::String(label) => Some(ConfiguredMaker {
+            label: label.clone(),
+            target: maker_target(label),
+            platforms: Vec::new(),
+        }),
+        JsonValue::Object(object) => {
+            let label = object
+                .get("name")
+                .or_else(|| object.get("target"))
+                .or_else(|| object.get("maker"))
+                .and_then(JsonValue::as_str)?
+                .to_string();
+            Some(ConfiguredMaker {
+                target: maker_target(&label),
+                platforms: string_values(object.get("platforms")),
+                label,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn maker_target(label: &str) -> Option<MakeTarget> {
+    let label = label.trim().to_ascii_lowercase();
+    let compact = label
+        .trim_start_matches("@electron-forge/")
+        .trim_start_matches("electron-forge-")
+        .trim_start_matches("maker-");
+
+    if matches!(compact, "zip" | "@electron-forge/maker-zip")
+        || label.ends_with("/maker-zip")
+        || label.ends_with("maker-zip")
+    {
+        Some(MakeTarget::Zip)
+    } else if compact == "dmg" || label.ends_with("/maker-dmg") || label.ends_with("maker-dmg") {
+        Some(MakeTarget::Dmg)
+    } else if compact == "deb" || label.ends_with("/maker-deb") || label.ends_with("maker-deb") {
+        Some(MakeTarget::Deb)
+    } else if compact == "rpm" || label.ends_with("/maker-rpm") || label.ends_with("maker-rpm") {
+        Some(MakeTarget::Rpm)
+    } else if matches!(compact, "msi" | "wix")
+        || label.ends_with("/maker-wix")
+        || label.ends_with("maker-wix")
+    {
+        Some(MakeTarget::Msi)
+    } else {
+        None
+    }
+}
+
+fn maker_applies_to_platform(maker: &ConfiguredMaker, platform: &str) -> bool {
+    maker.platforms.is_empty()
+        || maker
+            .platforms
+            .iter()
+            .any(|configured| configured == platform || configured == "*")
+}
+
+fn string_values(value: Option<&JsonValue>) -> Vec<String> {
+    match value {
+        Some(JsonValue::String(value)) => vec![value.clone()],
+        Some(JsonValue::Array(values)) => values
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .map(ToOwned::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn current_platform_label() -> String {
+    if cfg!(target_os = "macos") {
+        "darwin".to_string()
+    } else if cfg!(target_os = "windows") {
+        "win32".to_string()
+    } else {
+        "linux".to_string()
+    }
+}
+
 pub(crate) fn execute_make(report: &mut MakeReport, args: &MakeArgs) -> Result<()> {
+    ensure_package_ready(std::slice::from_mut(report), args)?;
+    execute_make_artifact(report, args)?;
+    Ok(())
+}
+
+pub(crate) fn execute_make_reports(reports: &mut [MakeReport], args: &MakeArgs) -> Result<()> {
+    if reports.is_empty() {
+        bail!("No make targets were resolved.");
+    }
+    ensure_package_ready(reports, args)?;
+    for report in reports {
+        execute_make_artifact(report, args)?;
+        report.mark_made()?;
+    }
+    Ok(())
+}
+
+fn ensure_package_ready(reports: &mut [MakeReport], args: &MakeArgs) -> Result<()> {
+    let first = reports
+        .first_mut()
+        .context("No make targets were resolved.")?;
     if !args.skip_package {
-        package::execute_package(&report.package, args.force)?;
-        report.package.mark_packaged();
-    } else if !Path::new(report.package.bundle_dir().as_str()).exists() {
+        package::execute_package(&first.package, args.force)?;
+        for report in reports {
+            report.package.mark_packaged();
+        }
+    } else if !Path::new(first.package.bundle_dir().as_str()).exists() {
         bail!(
             "Package output does not exist: {}. Run without --skip-package or run electron-cli package first.",
-            report.package.bundle_dir()
+            first.package.bundle_dir()
         );
     }
 
+    Ok(())
+}
+
+fn execute_make_artifact(report: &mut MakeReport, args: &MakeArgs) -> Result<()> {
     let artifact = Path::new(report.artifact.as_str());
     if artifact.exists() {
         if args.force {
@@ -151,7 +398,7 @@ pub(crate) fn execute_make(report: &mut MakeReport, args: &MakeArgs) -> Result<(
 
     fs::create_dir_all(report.make_dir.as_str())
         .with_context(|| format!("Could not create {}", report.make_dir))?;
-    match args.target {
+    match report.target_kind {
         MakeTarget::Zip => {
             write_zip_archive(Path::new(report.package.bundle_dir().as_str()), artifact)?
         }
@@ -202,6 +449,69 @@ fn print_report(report: &MakeReport, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_reports(reports: &[MakeReport], json: bool, status: MakeStatus) -> Result<()> {
+    if reports.len() == 1 {
+        return print_report(&reports[0], json);
+    }
+
+    let warnings = combined_warnings(reports);
+    if json {
+        return output::json(&MakeRunReport {
+            targets: reports,
+            dry_run: reports.iter().any(|report| report.dry_run),
+            status,
+            warnings,
+        });
+    }
+
+    println!("electron-cli make");
+    println!();
+    if let Some(first) = reports.first() {
+        println!("Project");
+        println!("  root: {}", first.package.project().root);
+        match first.package.project().package_label() {
+            Some(label) => println!("  package: {label}"),
+            None => println!("  package: not found"),
+        }
+        println!("  app name: {}", first.package.app_name());
+        println!(
+            "  target platform: {} {}",
+            first.package.platform(),
+            first.package.arch()
+        );
+        println!("  status: {}", status.as_str());
+    }
+
+    println!();
+    println!("Artifacts");
+    for report in reports {
+        println!("  {}: {}", report.target, report.artifact);
+        if let Some(size) = report.artifact_size {
+            println!("    size: {size} bytes");
+        }
+    }
+
+    if !warnings.is_empty() {
+        println!();
+        println!("Warnings");
+        for warning in warnings {
+            println!("  {warning}");
+        }
+    }
+
+    Ok(())
+}
+
+fn combined_warnings(reports: &[MakeReport]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for warning in reports.iter().flat_map(|report| report.warnings()) {
+        if !warnings.contains(warning) {
+            warnings.push(warning.clone());
+        }
+    }
+    warnings
 }
 
 fn make_artifact_path(make_dir: &Path, package: &PackageReport, target: MakeTarget) -> PathBuf {
@@ -1909,7 +2219,7 @@ mod tests {
             name: None,
             platform: None,
             arch: None,
-            target: crate::cli::MakeTarget::Zip,
+            target: Some(crate::cli::MakeTarget::Zip),
             skip_package: false,
             force: false,
             dry_run: true,
@@ -1946,7 +2256,7 @@ mod tests {
             name: None,
             platform: Some("linux".to_string()),
             arch: Some("x64".to_string()),
-            target: crate::cli::MakeTarget::Deb,
+            target: Some(crate::cli::MakeTarget::Deb),
             skip_package: false,
             force: false,
             dry_run: true,
@@ -1980,7 +2290,7 @@ mod tests {
             name: None,
             platform: Some("darwin".to_string()),
             arch: Some("arm64".to_string()),
-            target: crate::cli::MakeTarget::Dmg,
+            target: Some(crate::cli::MakeTarget::Dmg),
             skip_package: false,
             force: false,
             dry_run: true,
@@ -2014,7 +2324,7 @@ mod tests {
             name: None,
             platform: Some("linux".to_string()),
             arch: Some("x64".to_string()),
-            target: crate::cli::MakeTarget::Rpm,
+            target: Some(crate::cli::MakeTarget::Rpm),
             skip_package: false,
             force: false,
             dry_run: true,
@@ -2048,7 +2358,7 @@ mod tests {
             name: None,
             platform: Some("win32".to_string()),
             arch: Some("x64".to_string()),
-            target: crate::cli::MakeTarget::Msi,
+            target: Some(crate::cli::MakeTarget::Msi),
             skip_package: false,
             force: false,
             dry_run: true,
@@ -2070,6 +2380,79 @@ mod tests {
     }
 
     #[test]
+    fn builds_make_reports_from_configured_forge_makers() {
+        let root = unique_temp_dir("configured-makers");
+        write_package_json_with_makers(
+            &root,
+            r#"[
+                {"name":"@electron-forge/maker-zip"},
+                {"name":"@electron-forge/maker-deb","platforms":["linux"]},
+                {"name":"@electron-forge/maker-rpm","platforms":["darwin"]},
+                {"name":"@electron-forge/maker-squirrel","platforms":["linux"]}
+            ]"#,
+        );
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("linux".to_string()),
+            arch: Some("x64".to_string()),
+            target: None,
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let reports = build_reports(&args).expect("reports should build");
+
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].target(), "zip");
+        assert_eq!(reports[1].target(), "deb");
+        assert!(reports[0]
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("@electron-forge/maker-squirrel")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_make_target_overrides_configured_makers() {
+        let root = unique_temp_dir("target-override");
+        write_package_json_with_makers(
+            &root,
+            r#"[{"name":"@electron-forge/maker-zip"},{"name":"@electron-forge/maker-deb"}]"#,
+        );
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("win32".to_string()),
+            arch: Some("x64".to_string()),
+            target: Some(crate::cli::MakeTarget::Msi),
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let report = build_report(&args).expect("report should build");
+
+        assert_eq!(report.target(), "msi");
+        assert!(report
+            .warnings()
+            .iter()
+            .all(|warning| !warning.contains("maker-deb")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn makes_zip_artifact_after_packaging() {
         let root = unique_temp_dir("execute");
         write_package_json(&root);
@@ -2082,7 +2465,7 @@ mod tests {
             name: None,
             platform: None,
             arch: None,
-            target: crate::cli::MakeTarget::Zip,
+            target: Some(crate::cli::MakeTarget::Zip),
             skip_package: false,
             force: false,
             dry_run: false,
@@ -2112,6 +2495,44 @@ mod tests {
     }
 
     #[test]
+    fn makes_multiple_configured_artifacts_from_existing_package() {
+        let root = unique_temp_dir("configured-execute");
+        write_package_json_with_makers(
+            &root,
+            r#"[
+                {"name":"@electron-forge/maker-zip","platforms":["win32"]},
+                {"name":"@electron-forge/maker-wix","platforms":["win32"]}
+            ]"#,
+        );
+        write_app_file(&root);
+        write_fake_windows_bundle(&root.join("out/starter-app-win32-x64"), "starter-app.exe");
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("win32".to_string()),
+            arch: Some("x64".to_string()),
+            target: None,
+            skip_package: true,
+            force: false,
+            dry_run: false,
+            json: true,
+        };
+        let mut reports = build_reports(&args).expect("reports should build");
+
+        execute_make_reports(&mut reports, &args).expect("configured makers should execute");
+
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].target(), "zip");
+        assert_eq!(reports[1].target(), "msi");
+        assert!(Path::new(reports[0].artifact.as_str()).exists());
+        assert!(Path::new(reports[1].artifact.as_str()).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn writes_deb_archive_with_control_and_data_members() {
         let root = unique_temp_dir("deb-archive");
         write_package_json(&root);
@@ -2124,7 +2545,7 @@ mod tests {
             name: None,
             platform: Some("linux".to_string()),
             arch: Some("x64".to_string()),
-            target: crate::cli::MakeTarget::Deb,
+            target: Some(crate::cli::MakeTarget::Deb),
             skip_package: false,
             force: false,
             dry_run: true,
@@ -2183,7 +2604,7 @@ mod tests {
             name: None,
             platform: Some("darwin".to_string()),
             arch: Some("arm64".to_string()),
-            target: crate::cli::MakeTarget::Dmg,
+            target: Some(crate::cli::MakeTarget::Dmg),
             skip_package: false,
             force: false,
             dry_run: true,
@@ -2251,7 +2672,7 @@ mod tests {
             name: None,
             platform: Some("linux".to_string()),
             arch: Some("x64".to_string()),
-            target: crate::cli::MakeTarget::Rpm,
+            target: Some(crate::cli::MakeTarget::Rpm),
             skip_package: false,
             force: false,
             dry_run: true,
@@ -2310,7 +2731,7 @@ mod tests {
             name: None,
             platform: Some("win32".to_string()),
             arch: Some("x64".to_string()),
-            target: crate::cli::MakeTarget::Msi,
+            target: Some(crate::cli::MakeTarget::Msi),
             skip_package: false,
             force: false,
             dry_run: true,
@@ -2384,7 +2805,7 @@ mod tests {
             name: None,
             platform: None,
             arch: None,
-            target: crate::cli::MakeTarget::Deb,
+            target: Some(crate::cli::MakeTarget::Deb),
             skip_package: false,
             force: false,
             dry_run: false,
@@ -2416,7 +2837,7 @@ mod tests {
             name: None,
             platform: None,
             arch: None,
-            target: crate::cli::MakeTarget::Dmg,
+            target: Some(crate::cli::MakeTarget::Dmg),
             skip_package: false,
             force: false,
             dry_run: false,
@@ -2448,7 +2869,7 @@ mod tests {
             name: None,
             platform: None,
             arch: None,
-            target: crate::cli::MakeTarget::Rpm,
+            target: Some(crate::cli::MakeTarget::Rpm),
             skip_package: false,
             force: false,
             dry_run: false,
@@ -2469,6 +2890,23 @@ mod tests {
             r#"{"name":"starter-app","version":"0.1.0","license":"MIT","main":"src/main.js","devDependencies":{"electron":"30.0.0"}}"#,
         )
         .expect("package.json should be written");
+    }
+
+    fn write_package_json_with_makers(root: &Path, makers: &str) {
+        fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{
+                    "name":"starter-app",
+                    "version":"0.1.0",
+                    "license":"MIT",
+                    "main":"src/main.js",
+                    "devDependencies":{{"electron":"30.0.0"}},
+                    "config":{{"forge":{{"makers":{makers}}}}}
+                }}"#
+            ),
+        )
+        .expect("package.json with makers should be written");
     }
 
     fn write_app_file(root: &Path) {
