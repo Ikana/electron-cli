@@ -18,6 +18,7 @@ pub(crate) struct PackageReport {
     app_name: String,
     executable_name: String,
     metadata: PackageMetadata,
+    signing: PackageSigningPlan,
     platform: String,
     arch: String,
     electron_dist: Utf8PathBuf,
@@ -55,6 +56,37 @@ struct IconResource {
     to: Utf8PathBuf,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct PackageSigningPlan {
+    macos: MacosSigningPlan,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MacosSigningPlan {
+    sign: MacosSignPlan,
+    notarize: MacosNotarizePlan,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MacosSignPlan {
+    configured: bool,
+    enabled: bool,
+    identity: Option<String>,
+    entitlements: Vec<Utf8PathBuf>,
+    entitlements_inherit: Option<Utf8PathBuf>,
+    hardened_runtime: Option<bool>,
+    gatekeeper_assess: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MacosNotarizePlan {
+    configured: bool,
+    enabled: bool,
+    auth_method: Option<String>,
+    keychain_profile: Option<String>,
+    keychain: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum PackageStatus {
@@ -82,6 +114,35 @@ struct PackagerConfig {
     icon: Vec<String>,
     extra_resource: Vec<String>,
     darwin_dark_mode_support: bool,
+    osx_sign: MacosSignConfig,
+    osx_notarize: MacosNotarizeConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MacosSignConfig {
+    configured: bool,
+    enabled: bool,
+    invalid_type: bool,
+    identity: Option<String>,
+    entitlements: Vec<String>,
+    entitlements_inherit: Option<String>,
+    hardened_runtime: Option<bool>,
+    gatekeeper_assess: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MacosNotarizeConfig {
+    configured: bool,
+    enabled: bool,
+    invalid_type: bool,
+    apple_id_set: bool,
+    apple_id_password_set: bool,
+    team_id_set: bool,
+    apple_api_key: Option<String>,
+    apple_api_key_id_set: bool,
+    apple_api_issuer_set: bool,
+    keychain_profile: Option<String>,
+    keychain: Option<String>,
 }
 
 pub fn run(args: PackageArgs) -> Result<()> {
@@ -133,6 +194,7 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         &app_resources_dir,
         &platform,
     )?;
+    let (signing, signing_warnings) = package_signing(root, &package_config, &platform)?;
 
     let mut warnings = package_config.warnings.clone();
     if snapshot.package_json.is_none() {
@@ -170,6 +232,7 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
 
     warnings.extend(runtime_dependency_warnings(root, &snapshot));
     warnings.extend(metadata_warnings);
+    warnings.extend(signing_warnings);
 
     let create_dirs = vec![package_root.clone(), app_resources_dir.clone()];
     let mut copy_steps = vec![
@@ -200,6 +263,7 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         app_name,
         executable_name,
         metadata,
+        signing,
         platform,
         arch,
         electron_dist: utf8_path(electron_dist)?,
@@ -325,6 +389,33 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
     println!("  target: {} {}", report.platform, report.arch);
     println!("  status: {}", report.status.as_str());
 
+    if report.signing.macos.sign.configured || report.signing.macos.notarize.configured {
+        println!();
+        println!("Signing");
+        println!(
+            "  macOS signing: {}",
+            if report.signing.macos.sign.enabled {
+                "configured"
+            } else {
+                "disabled"
+            }
+        );
+        if let Some(identity) = &report.signing.macos.sign.identity {
+            println!("  identity: {identity}");
+        }
+        println!(
+            "  macOS notarization: {}",
+            if report.signing.macos.notarize.enabled {
+                "configured"
+            } else {
+                "disabled"
+            }
+        );
+        if let Some(method) = &report.signing.macos.notarize.auth_method {
+            println!("  notarization auth: {method}");
+        }
+    }
+
     println!();
     println!("Output");
     println!("  {}", report.bundle_dir);
@@ -400,6 +491,114 @@ fn parse_packager_config(value: &JsonValue) -> PackagerConfig {
             .get("darwinDarkModeSupport")
             .and_then(JsonValue::as_bool)
             .unwrap_or(false),
+        osx_sign: parse_macos_sign_config(value.get("osxSign")),
+        osx_notarize: parse_macos_notarize_config(value.get("osxNotarize")),
+    }
+}
+
+fn parse_macos_sign_config(value: Option<&JsonValue>) -> MacosSignConfig {
+    match value {
+        None => MacosSignConfig::default(),
+        Some(JsonValue::Bool(false)) => MacosSignConfig {
+            configured: true,
+            enabled: false,
+            ..MacosSignConfig::default()
+        },
+        Some(JsonValue::Bool(true)) => MacosSignConfig {
+            configured: true,
+            enabled: true,
+            ..MacosSignConfig::default()
+        },
+        Some(JsonValue::Object(object)) => {
+            let entitlements = [
+                "entitlements",
+                "entitlementsInherit",
+                "entitlementsLoginHelper",
+            ]
+            .iter()
+            .filter_map(|key| {
+                object
+                    .get(*key)
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect();
+
+            MacosSignConfig {
+                configured: true,
+                enabled: true,
+                invalid_type: false,
+                identity: object
+                    .get("identity")
+                    .or_else(|| object.get("identityName"))
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
+                entitlements,
+                entitlements_inherit: object
+                    .get("entitlementsInherit")
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
+                hardened_runtime: object.get("hardenedRuntime").and_then(JsonValue::as_bool),
+                gatekeeper_assess: object.get("gatekeeperAssess").and_then(JsonValue::as_bool),
+            }
+        }
+        Some(_) => MacosSignConfig {
+            configured: true,
+            invalid_type: true,
+            ..MacosSignConfig::default()
+        },
+    }
+}
+
+fn parse_macos_notarize_config(value: Option<&JsonValue>) -> MacosNotarizeConfig {
+    match value {
+        None => MacosNotarizeConfig::default(),
+        Some(JsonValue::Bool(false)) => MacosNotarizeConfig {
+            configured: true,
+            enabled: false,
+            ..MacosNotarizeConfig::default()
+        },
+        Some(JsonValue::Bool(true)) => MacosNotarizeConfig {
+            configured: true,
+            enabled: true,
+            ..MacosNotarizeConfig::default()
+        },
+        Some(JsonValue::Object(object)) => MacosNotarizeConfig {
+            configured: true,
+            enabled: true,
+            invalid_type: false,
+            apple_id_set: object.get("appleId").and_then(JsonValue::as_str).is_some(),
+            apple_id_password_set: object
+                .get("appleIdPassword")
+                .and_then(JsonValue::as_str)
+                .is_some(),
+            team_id_set: object.get("teamId").and_then(JsonValue::as_str).is_some(),
+            apple_api_key: object
+                .get("appleApiKey")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned),
+            apple_api_key_id_set: object
+                .get("appleApiKeyId")
+                .and_then(JsonValue::as_str)
+                .is_some(),
+            apple_api_issuer_set: object
+                .get("appleApiIssuer")
+                .and_then(JsonValue::as_str)
+                .is_some(),
+            keychain_profile: object
+                .get("keychainProfile")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned),
+            keychain: object
+                .get("keychain")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned),
+        },
+        Some(_) => MacosNotarizeConfig {
+            configured: true,
+            invalid_type: true,
+            ..MacosNotarizeConfig::default()
+        },
     }
 }
 
@@ -471,6 +670,146 @@ fn package_metadata(
         },
         warnings,
     ))
+}
+
+fn package_signing(
+    root: &Path,
+    config: &PackageJsonConfig,
+    platform: &str,
+) -> Result<(PackageSigningPlan, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let sign = macos_sign_plan(root, &config.packager.osx_sign, platform, &mut warnings)?;
+    let notarize = macos_notarize_plan(root, config, platform, &mut warnings);
+
+    Ok((
+        PackageSigningPlan {
+            macos: MacosSigningPlan { sign, notarize },
+        },
+        warnings,
+    ))
+}
+
+fn macos_sign_plan(
+    root: &Path,
+    config: &MacosSignConfig,
+    platform: &str,
+    warnings: &mut Vec<String>,
+) -> Result<MacosSignPlan> {
+    if config.invalid_type {
+        warnings.push("packagerConfig.osxSign must be false, true, or an object.".to_string());
+    }
+
+    let entitlements = config
+        .entitlements
+        .iter()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| {
+            let resolved = resolve_project_path(root, path);
+            if !resolved.exists() {
+                warnings.push(format!(
+                    "Configured macOS entitlements file does not exist: {}.",
+                    resolved.display()
+                ));
+            }
+            utf8_path(resolved)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let entitlements_inherit = config
+        .entitlements_inherit
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| utf8_path(resolve_project_path(root, path)))
+        .transpose()?;
+
+    if config.configured && platform != "darwin" {
+        warnings.push(format!(
+            "macOS signing is configured but ignored for target platform {platform}."
+        ));
+    } else if config.enabled {
+        warnings.push(
+            "macOS signing is configured, but Rust-native signing is not implemented yet; package output will be unsigned.".to_string(),
+        );
+    }
+
+    Ok(MacosSignPlan {
+        configured: config.configured,
+        enabled: config.enabled,
+        identity: config.identity.clone(),
+        entitlements,
+        entitlements_inherit,
+        hardened_runtime: config.hardened_runtime,
+        gatekeeper_assess: config.gatekeeper_assess,
+    })
+}
+
+fn macos_notarize_plan(
+    root: &Path,
+    package_config: &PackageJsonConfig,
+    platform: &str,
+    warnings: &mut Vec<String>,
+) -> MacosNotarizePlan {
+    let config = &package_config.packager.osx_notarize;
+    if config.invalid_type {
+        warnings.push("packagerConfig.osxNotarize must be false, true, or an object.".to_string());
+    }
+
+    let auth_method = macos_notarize_auth_method(config);
+    if config.configured && platform != "darwin" {
+        warnings.push(format!(
+            "macOS notarization is configured but ignored for target platform {platform}."
+        ));
+    } else if config.enabled {
+        warnings.push(
+            "macOS notarization is configured, but Rust-native notarization is not implemented yet.".to_string(),
+        );
+    }
+
+    if config.enabled && !package_config.packager.osx_sign.enabled {
+        warnings.push(
+            "macOS notarization requires packagerConfig.osxSign to be enabled first.".to_string(),
+        );
+    }
+    if config.enabled && auth_method.is_none() {
+        warnings.push(
+            "macOS notarization config is missing a complete notarytool authentication set: appleId/appleIdPassword/teamId, appleApiKey/appleApiKeyId/appleApiIssuer, or keychainProfile.".to_string(),
+        );
+    }
+    if let Some(api_key) = &config.apple_api_key {
+        let path = resolve_project_path(root, api_key);
+        if !path.exists() {
+            warnings.push(format!(
+                "Configured Apple API key file does not exist: {}.",
+                path.display()
+            ));
+        }
+    }
+
+    MacosNotarizePlan {
+        configured: config.configured,
+        enabled: config.enabled,
+        auth_method,
+        keychain_profile: config.keychain_profile.clone(),
+        keychain: config.keychain.clone(),
+    }
+}
+
+fn macos_notarize_auth_method(config: &MacosNotarizeConfig) -> Option<String> {
+    if config
+        .keychain_profile
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        Some("keychain-profile".to_string())
+    } else if config.apple_api_key.is_some()
+        && config.apple_api_key_id_set
+        && config.apple_api_issuer_set
+    {
+        Some("app-store-connect-api-key".to_string())
+    } else if config.apple_id_set && config.apple_id_password_set && config.team_id_set {
+        Some("apple-id".to_string())
+    } else {
+        None
+    }
 }
 
 fn resolve_icon_resource(
@@ -1158,6 +1497,12 @@ impl PackagerConfig {
         }
         self.darwin_dark_mode_support =
             other.darwin_dark_mode_support || self.darwin_dark_mode_support;
+        if other.osx_sign.configured {
+            self.osx_sign = other.osx_sign;
+        }
+        if other.osx_notarize.configured {
+            self.osx_notarize = other.osx_notarize;
+        }
     }
 }
 
@@ -1419,6 +1764,130 @@ mod tests {
             report.metadata.bundle_identifier,
             "com.example.forge-config"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plans_macos_signing_and_notarization_without_serializing_secrets() {
+        let root = unique_temp_dir("macos-signing-plan");
+        write_package_json(&root);
+        fs::write(root.join("entitlements.plist"), "<plist></plist>")
+            .expect("entitlements should be written");
+        fs::write(root.join("AuthKey_TEST.p8"), "secret api key")
+            .expect("api key should be written");
+        fs::write(
+            root.join("forge.config.js"),
+            r#"
+            module.exports = {
+              packagerConfig: {
+                osxSign: {
+                  identity: 'Developer ID Application: Example, Inc. (TEAMID1234)',
+                  entitlements: 'entitlements.plist',
+                  entitlementsInherit: 'entitlements.plist',
+                  hardenedRuntime: true,
+                  gatekeeperAssess: false,
+                },
+                osxNotarize: {
+                  appleApiKey: 'AuthKey_TEST.p8',
+                  appleApiKeyId: 'SECRET_KEY_ID',
+                  appleApiIssuer: 'SECRET_ISSUER_ID',
+                },
+              },
+            };
+            "#,
+        )
+        .expect("forge config should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("darwin".to_string()),
+            arch: Some("arm64".to_string()),
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.signing.macos.sign.configured);
+        assert!(report.signing.macos.sign.enabled);
+        assert_eq!(
+            report.signing.macos.sign.identity.as_deref(),
+            Some("Developer ID Application: Example, Inc. (TEAMID1234)")
+        );
+        assert_eq!(report.signing.macos.sign.hardened_runtime, Some(true));
+        assert_eq!(report.signing.macos.sign.gatekeeper_assess, Some(false));
+        assert_eq!(report.signing.macos.sign.entitlements.len(), 2);
+        assert!(report.signing.macos.notarize.configured);
+        assert_eq!(
+            report.signing.macos.notarize.auth_method.as_deref(),
+            Some("app-store-connect-api-key")
+        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Rust-native signing is not implemented")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Rust-native notarization is not implemented")));
+
+        let json = serde_json::to_string(&report).expect("report should serialize");
+        assert!(!json.contains("SECRET_KEY_ID"));
+        assert!(!json.contains("SECRET_ISSUER_ID"));
+        assert!(!json.contains("secret api key"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn warns_when_macos_notarization_is_configured_without_signing() {
+        let root = unique_temp_dir("notarize-without-sign");
+        write_package_json(&root);
+        fs::write(
+            root.join("forge.config.js"),
+            r#"
+            module.exports = {
+              packagerConfig: {
+                osxSign: false,
+                osxNotarize: {
+                  keychainProfile: 'notary-profile',
+                },
+              },
+            };
+            "#,
+        )
+        .expect("forge config should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("darwin".to_string()),
+            arch: Some("arm64".to_string()),
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.signing.macos.sign.configured);
+        assert!(!report.signing.macos.sign.enabled);
+        assert_eq!(
+            report.signing.macos.notarize.auth_method.as_deref(),
+            Some("keychain-profile")
+        );
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("macOS notarization requires packagerConfig.osxSign")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }

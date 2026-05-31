@@ -41,7 +41,9 @@ The Rust-native flow currently owns:
 
 The GitHub publisher creates or reuses a release, uploads selected make artifacts, and can replace an existing asset with `--force`. It reads `GITHUB_TOKEN` or `GH_TOKEN` and can infer `OWNER/REPO` from package metadata, Forge GitHub publisher config, or `package.json` `repository`. You can also pass `--github-repo`.
 
-The DMG maker is currently a pure-Rust FAT32 image with the app bundle and an Applications entry. The MSI maker writes a compressed embedded CAB, Windows Installer database tables, and a Start Menu shortcut when the packaged executable is present. HFS+/APFS DMG layout customization, installer UI customization, Windows/Linux icon embedding, signing, and notarization are still TODO.
+The package command recognizes macOS `packagerConfig.osxSign` and `packagerConfig.osxNotarize` options and reports the signing/notarization plan without serializing credential values. Actual Rust-native signing and notarization execution is not implemented yet.
+
+The DMG maker is currently a pure-Rust FAT32 image with the app bundle and an Applications entry. The MSI maker writes a compressed embedded CAB, Windows Installer database tables, and a Start Menu shortcut when the packaged executable is present. HFS+/APFS DMG layout customization, installer UI customization, Windows/Linux icon embedding, signing execution, and notarization execution are still TODO.
 
 Package metadata can be configured in `package.json`:
 
@@ -53,7 +55,15 @@ Package metadata can be configured in `package.json`:
       "appBundleId": "com.example.my-app",
       "appCategoryType": "public.app-category.developer-tools",
       "icon": "assets/icon",
-      "extraResource": "assets/config.json"
+      "extraResource": "assets/config.json",
+      "osxSign": {
+        "identity": "Developer ID Application: Example, Inc. (TEAMID1234)",
+        "entitlements": "assets/entitlements.plist",
+        "hardenedRuntime": true
+      },
+      "osxNotarize": {
+        "keychainProfile": "notary-profile"
+      }
     },
     "makers": [
       { "name": "@electron-forge/maker-zip" },
