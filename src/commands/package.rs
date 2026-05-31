@@ -62,9 +62,26 @@ struct PackageMetadata {
     build_version: Option<String>,
     app_category_type: Option<String>,
     app_copyright: Option<String>,
+    extend_info: ExtendInfoPlan,
+    protocols: Vec<MacosProtocolPlan>,
+    usage_description: BTreeMap<String, String>,
     icon: Option<IconResource>,
     extra_resources: Vec<CopyStep>,
     darwin_dark_mode_support: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ExtendInfoPlan {
+    file: Option<Utf8PathBuf>,
+    keys: Vec<String>,
+    #[serde(skip)]
+    values: PlistDictionary,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MacosProtocolPlan {
+    name: String,
+    schemes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -180,6 +197,9 @@ struct PackagerConfig {
     app_version: Option<String>,
     build_version: Option<String>,
     app_copyright: Option<String>,
+    extend_info: ExtendInfoConfig,
+    protocols: Vec<MacosProtocolPlan>,
+    usage_description: BTreeMap<String, String>,
     icon: Vec<String>,
     extra_resource: Vec<String>,
     ignore: Vec<String>,
@@ -188,6 +208,14 @@ struct PackagerConfig {
     darwin_dark_mode_support: bool,
     osx_sign: MacosSignConfig,
     osx_notarize: MacosNotarizeConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExtendInfoConfig {
+    configured: bool,
+    invalid_type: bool,
+    file: Option<String>,
+    values: PlistDictionary,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -779,6 +807,26 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
     if let Some(version) = &report.metadata.app_version {
         println!("  app version: {version}");
     }
+    if let Some(file) = &report.metadata.extend_info.file {
+        println!("  extend Info.plist: {file}");
+    } else if !report.metadata.extend_info.keys.is_empty() {
+        println!(
+            "  extend Info.plist: {}",
+            report.metadata.extend_info.keys.join(", ")
+        );
+    }
+    if !report.metadata.protocols.is_empty() {
+        println!(
+            "  URL protocols: {}",
+            report
+                .metadata
+                .protocols
+                .iter()
+                .map(|protocol| protocol.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!(
         "  dependency pruning: {}",
         if report.prune { "enabled" } else { "disabled" }
@@ -964,6 +1012,9 @@ fn parse_packager_config(value: &JsonValue) -> PackagerConfig {
         app_version: string_value(value, "appVersion"),
         build_version: string_value(value, "buildVersion"),
         app_copyright: string_value(value, "appCopyright"),
+        extend_info: parse_extend_info_config(value.get("extendInfo")),
+        protocols: parse_macos_protocols(value.get("protocols")),
+        usage_description: string_map(value.get("usageDescription")),
         icon: string_list(value.get("icon")),
         extra_resource: string_list(value.get("extraResource")),
         ignore: string_list(value.get("ignore")),
@@ -1011,6 +1062,86 @@ fn parse_asar_config(value: Option<&JsonValue>) -> AsarConfig {
             invalid_type: true,
             ..AsarConfig::default()
         },
+    }
+}
+
+fn parse_extend_info_config(value: Option<&JsonValue>) -> ExtendInfoConfig {
+    match value {
+        None => ExtendInfoConfig::default(),
+        Some(JsonValue::String(file)) => ExtendInfoConfig {
+            configured: true,
+            file: Some(file.clone()),
+            ..ExtendInfoConfig::default()
+        },
+        Some(JsonValue::Object(object)) => ExtendInfoConfig {
+            configured: true,
+            values: json_object_to_plist_dictionary(object),
+            ..ExtendInfoConfig::default()
+        },
+        Some(_) => ExtendInfoConfig {
+            configured: true,
+            invalid_type: true,
+            ..ExtendInfoConfig::default()
+        },
+    }
+}
+
+fn parse_macos_protocols(value: Option<&JsonValue>) -> Vec<MacosProtocolPlan> {
+    match value {
+        Some(JsonValue::Array(protocols)) => {
+            protocols.iter().filter_map(parse_macos_protocol).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_macos_protocol(value: &JsonValue) -> Option<MacosProtocolPlan> {
+    let object = value.as_object()?;
+    let name = object
+        .get("name")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())?
+        .to_string();
+    let schemes = string_list(object.get("schemes"))
+        .into_iter()
+        .map(|scheme| scheme.trim().to_string())
+        .filter(|scheme| !scheme.is_empty())
+        .collect::<Vec<_>>();
+
+    (!schemes.is_empty()).then_some(MacosProtocolPlan { name, schemes })
+}
+
+fn json_object_to_plist_dictionary(object: &serde_json::Map<String, JsonValue>) -> PlistDictionary {
+    let mut dictionary = PlistDictionary::new();
+    for (key, value) in object {
+        if let Some(value) = json_to_plist_value(value) {
+            dictionary.insert(key.clone(), value);
+        }
+    }
+    dictionary
+}
+
+fn json_to_plist_value(value: &JsonValue) -> Option<PlistValue> {
+    match value {
+        JsonValue::Null => None,
+        JsonValue::Bool(value) => Some(PlistValue::Boolean(*value)),
+        JsonValue::Number(value) => value
+            .as_i64()
+            .map(|value| PlistValue::Integer(value.into()))
+            .or_else(|| {
+                value
+                    .as_u64()
+                    .map(|value| PlistValue::Integer(value.into()))
+            })
+            .or_else(|| value.as_f64().map(PlistValue::Real)),
+        JsonValue::String(value) => Some(PlistValue::String(value.clone())),
+        JsonValue::Array(values) => Some(PlistValue::Array(
+            values.iter().filter_map(json_to_plist_value).collect(),
+        )),
+        JsonValue::Object(object) => Some(PlistValue::Dictionary(json_object_to_plist_dictionary(
+            object,
+        ))),
     }
 }
 
@@ -1290,6 +1421,7 @@ fn package_metadata(
         app_resources_dir,
         &mut warnings,
     )?;
+    let extend_info = resolve_extend_info(root, &config.packager.extend_info, &mut warnings)?;
     let app_version = config
         .packager
         .app_version
@@ -1311,6 +1443,9 @@ fn package_metadata(
                 .or_else(|| app_version.clone()),
             app_category_type: config.packager.app_category_type.clone(),
             app_copyright: config.packager.app_copyright.clone(),
+            extend_info,
+            protocols: config.packager.protocols.clone(),
+            usage_description: config.packager.usage_description.clone(),
             icon,
             extra_resources,
             darwin_dark_mode_support: config.packager.darwin_dark_mode_support,
@@ -1819,6 +1954,38 @@ fn resolve_extra_resources(
             })
         })
         .collect()
+}
+
+fn resolve_extend_info(
+    root: &Path,
+    extend_info: &ExtendInfoConfig,
+    warnings: &mut Vec<String>,
+) -> Result<ExtendInfoPlan> {
+    if extend_info.invalid_type {
+        warnings
+            .push("packagerConfig.extendInfo must be a plist file path or an object.".to_string());
+    }
+
+    let file = extend_info
+        .file
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| utf8_path(resolve_project_path(root, path)))
+        .transpose()?;
+    if let Some(path) = &file {
+        if !Path::new(path.as_str()).exists() {
+            warnings.push(format!(
+                "Configured extendInfo plist does not exist and packaging will fail: {}.",
+                path
+            ));
+        }
+    }
+
+    Ok(ExtendInfoPlan {
+        file,
+        keys: extend_info.values.keys().cloned().collect(),
+        values: extend_info.values.clone(),
+    })
 }
 
 fn resolve_project_path(root: &Path, path: &str) -> PathBuf {
@@ -2673,6 +2840,8 @@ fn apply_macos_metadata(report: &PackageReport) -> Result<()> {
         PlistDictionary::new()
     };
 
+    apply_extend_info(&mut dictionary, &report.metadata.extend_info)?;
+
     set_plist_string(&mut dictionary, "CFBundleName", &report.app_name);
     set_plist_string(&mut dictionary, "CFBundleDisplayName", &report.app_name);
     set_plist_string(
@@ -2699,6 +2868,26 @@ fn apply_macos_metadata(report: &PackageReport) -> Result<()> {
     if let Some(copyright) = &report.metadata.app_copyright {
         set_plist_string(&mut dictionary, "NSHumanReadableCopyright", copyright);
     }
+    if !report.metadata.protocols.is_empty() {
+        dictionary.insert(
+            "CFBundleURLTypes".to_string(),
+            PlistValue::Array(
+                report
+                    .metadata
+                    .protocols
+                    .iter()
+                    .map(macos_protocol_plist_value)
+                    .collect(),
+            ),
+        );
+    }
+    for (usage_type, description) in &report.metadata.usage_description {
+        set_plist_string(
+            &mut dictionary,
+            &format!("NS{usage_type}UsageDescription"),
+            description,
+        );
+    }
     if let Some(icon) = &report.metadata.icon {
         let icon_name = Path::new(icon.to.as_str())
             .file_name()
@@ -2722,6 +2911,47 @@ fn apply_macos_metadata(report: &PackageReport) -> Result<()> {
         .with_context(|| format!("Could not write {}", info_plist_path.display()))?;
 
     Ok(())
+}
+
+fn apply_extend_info(dictionary: &mut PlistDictionary, extend_info: &ExtendInfoPlan) -> Result<()> {
+    merge_plist_dictionary(dictionary, extend_info.values.clone());
+
+    if let Some(file) = &extend_info.file {
+        let file = Path::new(file.as_str());
+        let value = PlistValue::from_file(file)
+            .with_context(|| format!("Could not read extendInfo plist {}", file.display()))?;
+        let PlistValue::Dictionary(extend_dictionary) = value else {
+            bail!("extendInfo plist is not a dictionary: {}", file.display());
+        };
+        merge_plist_dictionary(dictionary, extend_dictionary);
+    }
+
+    Ok(())
+}
+
+fn merge_plist_dictionary(target: &mut PlistDictionary, source: PlistDictionary) {
+    for (key, value) in source {
+        target.insert(key, value);
+    }
+}
+
+fn macos_protocol_plist_value(protocol: &MacosProtocolPlan) -> PlistValue {
+    let mut dictionary = PlistDictionary::new();
+    dictionary.insert(
+        "CFBundleURLName".to_string(),
+        PlistValue::String(protocol.name.clone()),
+    );
+    dictionary.insert(
+        "CFBundleURLSchemes".to_string(),
+        PlistValue::Array(
+            protocol
+                .schemes
+                .iter()
+                .map(|scheme| PlistValue::String(scheme.clone()))
+                .collect(),
+        ),
+    );
+    PlistValue::Dictionary(dictionary)
 }
 
 fn set_plist_string(dictionary: &mut PlistDictionary, key: &str, value: &str) {
@@ -3195,6 +3425,15 @@ impl PackagerConfig {
         self.app_version = other.app_version.or_else(|| self.app_version.take());
         self.build_version = other.build_version.or_else(|| self.build_version.take());
         self.app_copyright = other.app_copyright.or_else(|| self.app_copyright.take());
+        if other.extend_info.configured {
+            self.extend_info = other.extend_info;
+        }
+        if !other.protocols.is_empty() {
+            self.protocols = other.protocols;
+        }
+        if !other.usage_description.is_empty() {
+            self.usage_description = other.usage_description;
+        }
         if !other.icon.is_empty() {
             self.icon = other.icon;
         }
@@ -3855,6 +4094,186 @@ mod tests {
             assert!(report.metadata.icon.is_some());
             assert!(report.warnings.is_empty());
         }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn applies_macos_extend_info_protocols_and_usage_descriptions() {
+        let root = unique_temp_dir("macos-info-plist-metadata");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name": "starter-app",
+                "productName": "Starter Pro",
+                "version": "2.3.4",
+                "main": "src/main.js",
+                "devDependencies": {
+                    "electron": "30.0.0"
+                },
+                "electronCli": {
+                    "packagerConfig": {
+                        "appBundleId": "com.example.starter",
+                        "extendInfo": {
+                            "CFBundleIdentifier": "com.example.from-extend-info",
+                            "LSMinimumSystemVersion": "12.0",
+                            "ITSAppUsesNonExemptEncryption": false
+                        },
+                        "protocols": [
+                            {
+                                "name": "Starter Links",
+                                "schemes": ["starter", "starter-secure"]
+                            }
+                        ],
+                        "usageDescription": {
+                            "Camera": "Needed for video calls",
+                            "Microphone": "Needed for voice calls"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_macos_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("darwin".to_string()),
+            arch: Some(current_arch()),
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+        fs::create_dir_all(Path::new(report.bundle_dir.as_str()).join("Contents"))
+            .expect("bundle contents should be created");
+
+        assert!(report
+            .metadata
+            .extend_info
+            .keys
+            .contains(&"CFBundleIdentifier".to_string()));
+        assert!(report
+            .metadata
+            .extend_info
+            .keys
+            .contains(&"LSMinimumSystemVersion".to_string()));
+        assert!(report
+            .metadata
+            .extend_info
+            .keys
+            .contains(&"ITSAppUsesNonExemptEncryption".to_string()));
+        assert_eq!(report.metadata.protocols.len(), 1);
+        assert_eq!(
+            report
+                .metadata
+                .usage_description
+                .get("Camera")
+                .map(String::as_str),
+            Some("Needed for video calls")
+        );
+
+        apply_macos_metadata(&report).expect("metadata should apply");
+
+        let plist = read_info_plist(&report);
+        assert_eq!(
+            plist_string(&plist, "CFBundleIdentifier"),
+            Some("com.example.starter")
+        );
+        assert_eq!(plist_string(&plist, "LSMinimumSystemVersion"), Some("12.0"));
+        assert_eq!(
+            plist_bool(&plist, "ITSAppUsesNonExemptEncryption"),
+            Some(false)
+        );
+        assert_eq!(
+            plist_string(&plist, "NSCameraUsageDescription"),
+            Some("Needed for video calls")
+        );
+        assert_eq!(
+            plist_string(&plist, "NSMicrophoneUsageDescription"),
+            Some("Needed for voice calls")
+        );
+
+        let protocols = plist_array(&plist, "CFBundleURLTypes")
+            .expect("URL protocol entries should be written");
+        assert_eq!(protocols.len(), 1);
+        let PlistValue::Dictionary(protocol) = &protocols[0] else {
+            panic!("protocol entry should be a dictionary");
+        };
+        assert_eq!(
+            plist_string(protocol, "CFBundleURLName"),
+            Some("Starter Links")
+        );
+        let schemes = plist_array(protocol, "CFBundleURLSchemes")
+            .expect("URL protocol schemes should be written");
+        assert_eq!(schemes.len(), 2);
+        assert_eq!(schemes[0].as_string(), Some("starter"));
+        assert_eq!(schemes[1].as_string(), Some("starter-secure"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn applies_macos_extend_info_from_plist_file() {
+        let root = unique_temp_dir("macos-info-plist-file");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name": "starter-app",
+                "version": "2.3.4",
+                "main": "src/main.js",
+                "devDependencies": {
+                    "electron": "30.0.0"
+                },
+                "electronCli": {
+                    "packagerConfig": {
+                        "extendInfo": "extra-info.plist"
+                    }
+                }
+            }"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_macos_electron_dist(&root);
+
+        let mut extra_info = PlistDictionary::new();
+        extra_info.insert(
+            "LSApplicationQueriesSchemes".to_string(),
+            PlistValue::Array(vec![PlistValue::String("example".to_string())]),
+        );
+        PlistValue::Dictionary(extra_info)
+            .to_file_xml(root.join("extra-info.plist"))
+            .expect("extendInfo plist should be written");
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("darwin".to_string()),
+            arch: Some(current_arch()),
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+        fs::create_dir_all(Path::new(report.bundle_dir.as_str()).join("Contents"))
+            .expect("bundle contents should be created");
+
+        assert!(report.metadata.extend_info.file.is_some());
+        assert!(report.metadata.extend_info.keys.is_empty());
+
+        apply_macos_metadata(&report).expect("metadata should apply");
+
+        let plist = read_info_plist(&report);
+        let schemes = plist_array(&plist, "LSApplicationQueriesSchemes")
+            .expect("extendInfo plist array should be merged");
+        assert_eq!(schemes.len(), 1);
+        assert_eq!(schemes[0].as_string(), Some("example"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4679,6 +5098,28 @@ mod tests {
         dictionary.get(key).and_then(PlistValue::as_string)
     }
 
+    fn plist_bool(dictionary: &PlistDictionary, key: &str) -> Option<bool> {
+        dictionary.get(key).and_then(PlistValue::as_boolean)
+    }
+
+    fn plist_array<'a>(dictionary: &'a PlistDictionary, key: &str) -> Option<&'a [PlistValue]> {
+        dictionary
+            .get(key)
+            .and_then(PlistValue::as_array)
+            .map(Vec::as_slice)
+    }
+
+    fn read_info_plist(report: &PackageReport) -> PlistDictionary {
+        let value = PlistValue::from_file(
+            Path::new(report.bundle_dir.as_str()).join("Contents/Info.plist"),
+        )
+        .expect("Info.plist should read");
+        let PlistValue::Dictionary(dictionary) = value else {
+            panic!("Info.plist should be a dictionary");
+        };
+        dictionary
+    }
+
     fn write_fake_electron_dist(root: &Path) {
         let dist = root.join("node_modules/electron/dist");
         if current_platform() == "darwin" {
@@ -4692,6 +5133,12 @@ mod tests {
             fs::create_dir_all(&dist).expect("fake electron dist should be created");
             fs::write(dist.join("electron"), "").expect("fake binary should be written");
         }
+    }
+
+    fn write_fake_macos_electron_dist(root: &Path) {
+        let app = root.join("node_modules/electron/dist/Electron.app/Contents/MacOS");
+        fs::create_dir_all(&app).expect("fake macOS electron app should be created");
+        fs::write(app.join("Electron"), "").expect("fake macOS binary should be written");
     }
 
     fn write_macho_electron_dist(root: &Path) {
