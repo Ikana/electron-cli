@@ -2729,7 +2729,7 @@ mod tests {
         assert!(!report
             .warnings
             .iter()
-            .any(|warning| warning.contains("not implemented")));
+            .any(|warning| warning.contains("Rust-native notarization is not implemented")));
 
         let json = serde_json::to_string(&report).expect("report should serialize");
         assert!(!json.contains("SECRET_KEY_ID"));
