@@ -100,6 +100,7 @@ struct AsarPlan {
     unpacked_dir: Option<Utf8PathBuf>,
     unpack: Vec<String>,
     unpack_dir: Vec<String>,
+    ordering: Option<Utf8PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -227,8 +228,10 @@ struct AsarConfig {
     configured: bool,
     enabled: bool,
     invalid_type: bool,
+    invalid_ordering_type: bool,
     unpack: Vec<String>,
     unpack_dir: Vec<String>,
+    ordering: Option<String>,
     unsupported_options: Vec<String>,
 }
 
@@ -373,7 +376,7 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         &platform,
     )?;
     let prune = package_config.packager.prune.unwrap_or(true);
-    let (asar, asar_warnings) = package_asar(&app_resources_dir, &package_config)?;
+    let (asar, asar_warnings) = package_asar(root, &app_resources_dir, &package_config)?;
     let (signing, signing_warnings) = package_signing(root, &package_config, &platform)?;
 
     let mut warnings = package_config.warnings.clone();
@@ -1000,6 +1003,9 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
         if !report.asar.unpack_dir.is_empty() {
             println!("  unpack dir: {}", report.asar.unpack_dir.join(", "));
         }
+        if let Some(ordering) = &report.asar.ordering {
+            println!("  ordering: {ordering}");
+        }
     }
 
     println!();
@@ -1111,13 +1117,20 @@ fn parse_asar_config(value: Option<&JsonValue>) -> AsarConfig {
             ..AsarConfig::default()
         },
         Some(JsonValue::Object(object)) => {
-            let supported_options = ["unpack", "unpackDir"];
+            let supported_options = ["unpack", "unpackDir", "ordering"];
+            let (ordering, invalid_ordering_type) = match object.get("ordering") {
+                Some(JsonValue::String(path)) => (Some(path.clone()), false),
+                Some(_) => (None, true),
+                None => (None, false),
+            };
             AsarConfig {
                 configured: true,
                 enabled: true,
                 invalid_type: false,
+                invalid_ordering_type,
                 unpack: string_list(object.get("unpack")),
                 unpack_dir: string_list(object.get("unpackDir")),
+                ordering,
                 unsupported_options: object
                     .keys()
                     .filter(|key| !supported_options.contains(&key.as_str()))
@@ -1536,6 +1549,7 @@ fn package_metadata(
 }
 
 fn package_asar(
+    root: &Path,
     app_resources_dir: &Path,
     config: &PackageJsonConfig,
 ) -> Result<(AsarPlan, Vec<String>)> {
@@ -1544,6 +1558,9 @@ fn package_asar(
 
     if config.invalid_type {
         warnings.push("packagerConfig.asar must be false, true, or an object.".to_string());
+    }
+    if config.invalid_ordering_type {
+        warnings.push("packagerConfig.asar.ordering must be a file path string.".to_string());
     }
 
     if config.enabled && !config.unsupported_options.is_empty() {
@@ -1554,6 +1571,22 @@ fn package_asar(
     }
     if config.enabled {
         let _ = AsarUnpackRules::compile(&config.unpack, &config.unpack_dir, Some(&mut warnings));
+    }
+    let ordering = config
+        .ordering
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| utf8_path(resolve_project_path(root, path)))
+        .transpose()?;
+    if config.enabled {
+        if let Some(path) = &ordering {
+            if !Path::new(path.as_str()).exists() {
+                warnings.push(format!(
+                    "Configured ASAR ordering file does not exist and packaging will fail: {}.",
+                    path
+                ));
+            }
+        }
     }
 
     Ok((
@@ -1570,6 +1603,7 @@ fn package_asar(
                 .transpose()?,
             unpack: config.unpack.clone(),
             unpack_dir: config.unpack_dir.clone(),
+            ordering,
         },
         warnings,
     ))
@@ -2584,6 +2618,7 @@ fn execute_asar_packaging(report: &PackageReport) -> Result<()> {
     let unpack_rules = AsarUnpackRules::from_plan(&report.asar);
     let entries = collect_asar_entries(&app_dir, &app_dir, &unpack_rules)
         .with_context(|| format!("Could not collect ASAR entries from {}", app_dir.display()))?;
+    let entries = apply_asar_ordering(entries, &report.asar)?;
     write_asar_archive(&entries, archive, unpacked_dir.as_deref())
         .with_context(|| format!("Could not write ASAR archive {}", archive.display()))?;
 
@@ -2593,6 +2628,76 @@ fn execute_asar_packaging(report: &PackageReport) -> Result<()> {
             app_dir.display()
         )
     })
+}
+
+fn apply_asar_ordering(entries: Vec<AsarEntry>, plan: &AsarPlan) -> Result<Vec<AsarEntry>> {
+    let Some(ordering) = &plan.ordering else {
+        return Ok(entries);
+    };
+
+    let ordering_path = Path::new(ordering.as_str());
+    let ordering_paths = read_asar_ordering_file(ordering_path).with_context(|| {
+        format!(
+            "Could not read ASAR ordering file {}",
+            ordering_path.display()
+        )
+    })?;
+    if ordering_paths.is_empty() {
+        return Ok(entries);
+    }
+
+    let mut priorities = BTreeMap::new();
+    for (index, path) in ordering_paths.into_iter().enumerate() {
+        priorities
+            .entry(path_to_forward_slashes(&path))
+            .or_insert(index);
+    }
+
+    let mut indexed_entries = entries.into_iter().enumerate().collect::<Vec<_>>();
+    indexed_entries.sort_by_key(|(index, entry)| {
+        (
+            priorities
+                .get(path_to_forward_slashes(&entry.relative).as_str())
+                .copied()
+                .unwrap_or(usize::MAX),
+            *index,
+        )
+    });
+
+    Ok(indexed_entries
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect())
+}
+
+fn read_asar_ordering_file(path: &Path) -> Result<Vec<PathBuf>> {
+    let contents = fs::read_to_string(path)?;
+    let mut ordered_paths = Vec::new();
+
+    for line in contents.lines() {
+        let line = line
+            .rsplit(':')
+            .next()
+            .unwrap_or(line)
+            .trim()
+            .trim_start_matches(['/', '\\']);
+        let normalized = path_to_forward_slashes(Path::new(line));
+        let normalized = normalized.trim_matches('/');
+        if normalized.is_empty() {
+            continue;
+        }
+
+        let mut prefix = PathBuf::new();
+        for component in normalized
+            .split('/')
+            .filter(|component| !component.is_empty())
+        {
+            prefix.push(component);
+            ordered_paths.push(prefix.clone());
+        }
+    }
+
+    Ok(ordered_paths)
 }
 
 fn collect_asar_entries(
@@ -4206,6 +4311,8 @@ mod tests {
         .expect("package.json should be written");
         write_app_file(&root);
         write_fake_electron_dist(&root);
+        fs::write(root.join("ordering.txt"), "src/main.js\n")
+            .expect("ASAR ordering file should be written");
 
         let args = PackageArgs {
             cwd: root.clone(),
@@ -4359,6 +4466,75 @@ mod tests {
     }
 
     #[test]
+    fn packages_asar_with_ordering_file() {
+        let root = unique_temp_dir("asar-ordering");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"starter-app","version":"0.1.0","main":"src/main.js","devDependencies":{"electron":"30.0.0"},"electronCli":{"packagerConfig":{"asar":{"ordering":"asar-ordering.txt"}}}}"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+        fs::create_dir_all(root.join("assets")).expect("assets dir should be created");
+        fs::write(root.join("src/early.js"), b"early").expect("early source should be written");
+        fs::write(root.join("assets/second.txt"), b"second")
+            .expect("second asset should be written");
+        fs::write(
+            root.join("asar-ordering.txt"),
+            "trace: /src/early.js\nassets/second.txt\n",
+        )
+        .expect("ASAR ordering file should be written");
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.asar.ordering.is_some());
+        assert!(report.warnings.is_empty());
+
+        execute_package(&report, false).expect("package should succeed");
+
+        let app_asar = Path::new(report.app_resources_dir.as_str()).join("app.asar");
+        let header = read_asar_header_json(&app_asar);
+        assert_eq!(
+            asar_header_file_offset(&header, &["src", "early.js"]),
+            Some("0")
+        );
+        assert_eq!(
+            asar_header_file_offset(&header, &["assets", "second.txt"]),
+            Some("5")
+        );
+
+        let archive = fs::read(&app_asar).expect("ASAR archive should read");
+        let reader = asar::AsarReader::new(&archive, None).expect("ASAR archive should parse");
+        assert_eq!(
+            reader
+                .read(Path::new("src/early.js"))
+                .expect("ordered file should be readable")
+                .data(),
+            b"early"
+        );
+        assert_eq!(
+            reader
+                .read(Path::new("assets/second.txt"))
+                .expect("second ordered file should be readable")
+                .data(),
+            b"second"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn warns_for_unsupported_asar_options_but_keeps_supported_unpacks() {
         let root = unique_temp_dir("asar-options");
         fs::write(
@@ -4387,10 +4563,11 @@ mod tests {
         assert!(report.asar.archive.is_some());
         assert_eq!(report.asar.unpack, vec!["**/*.node"]);
         assert_eq!(report.asar.unpack_dir, vec!["assets/native"]);
+        assert!(report.asar.ordering.is_some());
         assert!(report.warnings.iter().any(|warning| {
             warning.contains("packagerConfig.asar options")
-                && warning.contains("ordering")
                 && warning.contains("transform")
+                && !warning.contains("ordering")
                 && !warning.contains("unpackDir")
         }));
 
@@ -5630,6 +5807,24 @@ mod tests {
             panic!("Info.plist should be a dictionary");
         };
         dictionary
+    }
+
+    fn read_asar_header_json(path: &Path) -> JsonValue {
+        let archive = fs::read(path).expect("ASAR archive should read");
+        let json_size = u32::from_le_bytes(
+            archive[12..16]
+                .try_into()
+                .expect("ASAR header size should decode"),
+        ) as usize;
+        serde_json::from_slice(&archive[16..16 + json_size]).expect("ASAR header JSON should parse")
+    }
+
+    fn asar_header_file_offset<'a>(header: &'a JsonValue, path: &[&str]) -> Option<&'a str> {
+        let mut node = header;
+        for component in path {
+            node = node.get("files")?.get(*component)?;
+        }
+        node.get("offset").and_then(JsonValue::as_str)
     }
 
     fn write_macos_helper_info_plist(path: &Path) {
