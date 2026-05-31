@@ -16,6 +16,8 @@ use serde_json::Value as JsonValue;
 
 use crate::{cli::PackageArgs, output, project::ProjectSnapshot};
 
+const APPLE_TIMESTAMP_URL: &str = "http://timestamp.apple.com/ts01";
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct PackageReport {
     project: ProjectSnapshot,
@@ -84,6 +86,8 @@ struct MacosSignPlan {
     p12_password_file: Option<Utf8PathBuf>,
     #[serde(skip)]
     p12_password: RedactedSecret,
+    timestamp_url: Option<String>,
+    for_notarization: bool,
     entitlements: Vec<Utf8PathBuf>,
     entitlements_inherit: Option<Utf8PathBuf>,
     hardened_runtime: Option<bool>,
@@ -163,10 +167,18 @@ struct MacosSignConfig {
     p12_password: Option<String>,
     p12_password_env: Option<String>,
     p12_password_file: Option<String>,
+    timestamp: Option<MacosTimestampConfig>,
     entitlements: Vec<String>,
     entitlements_inherit: Option<String>,
     hardened_runtime: Option<bool>,
     gatekeeper_assess: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+enum MacosTimestampConfig {
+    Default,
+    Disabled,
+    Url(String),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -457,6 +469,9 @@ fn execute_macos_signing(report: &PackageReport) -> Result<()> {
             settings.set_signing_key(signing_key.as_key_info_signer(), certificate);
             settings.chain_apple_certificates();
             settings.set_team_id_from_signing_certificate();
+            settings
+                .ensure_for_notarization_settings()
+                .context("macOS signing settings are not compatible with notarization")?;
             signer
                 .write_signed_bundle(&signed_bundle_dir, &settings)
                 .with_context(|| {
@@ -502,6 +517,13 @@ fn macos_signing_settings<'key>(report: &PackageReport) -> Result<SigningSetting
     let sign = &report.signing.macos.sign;
     let mut settings = SigningSettings::default();
     settings.set_binary_identifier(SettingsScope::Main, &report.metadata.bundle_identifier);
+    settings.set_for_notarization(sign.for_notarization);
+
+    if let Some(timestamp_url) = &sign.timestamp_url {
+        settings
+            .set_time_stamp_url(timestamp_url)
+            .with_context(|| format!("Invalid macOS signing timestamp URL: {timestamp_url}"))?;
+    }
 
     if sign.hardened_runtime.unwrap_or(false) {
         settings.add_code_signature_flags(SettingsScope::Main, CodeSignatureFlags::RUNTIME);
@@ -600,6 +622,12 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
         }
         if let Some(source) = &report.signing.macos.sign.p12_password_source {
             println!("  p12 password: {source}");
+        }
+        if let Some(timestamp_url) = &report.signing.macos.sign.timestamp_url {
+            println!("  timestamp server: {timestamp_url}");
+        }
+        if report.signing.macos.sign.for_notarization {
+            println!("  signing mode: notarization-compatible");
         }
         if let Some(method) = &report.signing.macos.sign.method {
             println!("  signing method: {method}");
@@ -762,6 +790,12 @@ fn parse_macos_sign_config(value: Option<&JsonValue>) -> MacosSignConfig {
                     .or_else(|| object.get("pfxPasswordFile"))
                     .and_then(JsonValue::as_str)
                     .map(ToOwned::to_owned),
+                timestamp: parse_macos_timestamp_config(
+                    object
+                        .get("timestamp")
+                        .or_else(|| object.get("timestampUrl"))
+                        .or_else(|| object.get("timestampURL")),
+                ),
                 entitlements,
                 entitlements_inherit: object
                     .get("entitlementsInherit")
@@ -776,6 +810,22 @@ fn parse_macos_sign_config(value: Option<&JsonValue>) -> MacosSignConfig {
             invalid_type: true,
             ..MacosSignConfig::default()
         },
+    }
+}
+
+fn parse_macos_timestamp_config(value: Option<&JsonValue>) -> Option<MacosTimestampConfig> {
+    match value {
+        Some(JsonValue::String(value)) => {
+            let value = value.trim();
+            if value.is_empty() || value.eq_ignore_ascii_case("none") {
+                Some(MacosTimestampConfig::Disabled)
+            } else {
+                Some(MacosTimestampConfig::Url(value.to_string()))
+            }
+        }
+        Some(JsonValue::Bool(true)) => Some(MacosTimestampConfig::Default),
+        Some(JsonValue::Bool(false)) => Some(MacosTimestampConfig::Disabled),
+        _ => None,
     }
 }
 
@@ -907,7 +957,13 @@ fn package_signing(
     platform: &str,
 ) -> Result<(PackageSigningPlan, Vec<String>)> {
     let mut warnings = Vec::new();
-    let sign = macos_sign_plan(root, &config.packager.osx_sign, platform, &mut warnings)?;
+    let sign = macos_sign_plan(
+        root,
+        &config.packager.osx_sign,
+        &config.packager.osx_notarize,
+        platform,
+        &mut warnings,
+    )?;
     let notarize = macos_notarize_plan(root, config, platform, &mut warnings);
 
     Ok((
@@ -921,6 +977,7 @@ fn package_signing(
 fn macos_sign_plan(
     root: &Path,
     config: &MacosSignConfig,
+    notarize_config: &MacosNotarizeConfig,
     platform: &str,
     warnings: &mut Vec<String>,
 ) -> Result<MacosSignPlan> {
@@ -1008,6 +1065,9 @@ fn macos_sign_plan(
     let ad_hoc_identity = matches!(identity, None | Some("-"));
     let p12_identity = p12_file.is_some();
     let will_execute = config.enabled && platform == "darwin" && (ad_hoc_identity || p12_identity);
+    let timestamp_url = macos_timestamp_url(config, p12_identity, notarize_config.enabled);
+    let for_notarization =
+        will_execute && p12_identity && notarize_config.enabled && timestamp_url.is_some();
     let method = if config.enabled && platform == "darwin" {
         if p12_identity {
             Some("certificate-p12".to_string())
@@ -1049,6 +1109,16 @@ fn macos_sign_plan(
                 "packagerConfig.osxSign.gatekeeperAssess is recognized but Gatekeeper assessment is not implemented yet.".to_string(),
             );
         }
+        if config.timestamp.is_some() && !p12_identity {
+            warnings.push(
+                "packagerConfig.osxSign.timestamp is recognized but ignored without p12File certificate signing.".to_string(),
+            );
+        }
+        if notarize_config.enabled && p12_identity && timestamp_url.is_none() {
+            warnings.push(
+                "macOS notarization requires a secure timestamp; packagerConfig.osxSign.timestamp disabled timestamping.".to_string(),
+            );
+        }
     }
 
     Ok(MacosSignPlan {
@@ -1062,11 +1132,31 @@ fn macos_sign_plan(
         p12_password_env: config.p12_password_env.clone(),
         p12_password_file,
         p12_password: RedactedSecret::new(config.p12_password.clone()),
+        timestamp_url,
+        for_notarization,
         entitlements,
         entitlements_inherit,
         hardened_runtime: config.hardened_runtime,
         gatekeeper_assess: config.gatekeeper_assess,
     })
+}
+
+fn macos_timestamp_url(
+    config: &MacosSignConfig,
+    p12_identity: bool,
+    notarize_enabled: bool,
+) -> Option<String> {
+    if !p12_identity {
+        return None;
+    }
+
+    match &config.timestamp {
+        Some(MacosTimestampConfig::Default) => Some(APPLE_TIMESTAMP_URL.to_string()),
+        Some(MacosTimestampConfig::Disabled) => None,
+        Some(MacosTimestampConfig::Url(url)) => Some(url.clone()),
+        None if notarize_enabled => Some(APPLE_TIMESTAMP_URL.to_string()),
+        None => None,
+    }
 }
 
 fn macos_notarize_plan(
@@ -2259,6 +2349,7 @@ mod tests {
                   identity: 'Developer ID Application: Example, Inc. (TEAMID1234)',
                   p12File: 'developer-id.p12',
                   p12Password: 'p12-secret',
+                  timestamp: 'http://timestamp.example.test/tsa',
                   hardenedRuntime: true,
                 },
               },
@@ -2293,6 +2384,11 @@ mod tests {
             report.signing.macos.sign.p12_password_source.as_deref(),
             Some("config")
         );
+        assert_eq!(
+            report.signing.macos.sign.timestamp_url.as_deref(),
+            Some("http://timestamp.example.test/tsa")
+        );
+        assert!(!report.signing.macos.sign.for_notarization);
         assert!(report.signing.macos.sign.p12_file.is_some());
         assert!(report
             .warnings
@@ -2301,6 +2397,124 @@ mod tests {
 
         let json = serde_json::to_string(&report).expect("report should serialize");
         assert!(!json.contains("p12-secret"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plans_macos_p12_signing_for_notarization_with_default_timestamp() {
+        let root = unique_temp_dir("macos-p12-notarization-signing-plan");
+        write_package_json(&root);
+        fs::write(root.join("developer-id.p12"), "not a real p12")
+            .expect("p12 placeholder should be written");
+        fs::write(
+            root.join("forge.config.js"),
+            r#"
+            module.exports = {
+              packagerConfig: {
+                appBundleId: 'com.example.notarized',
+                osxSign: {
+                  p12File: 'developer-id.p12',
+                  p12PasswordEnv: 'P12_PASSWORD',
+                },
+                osxNotarize: {
+                  keychainProfile: 'notary-profile',
+                },
+              },
+            };
+            "#,
+        )
+        .expect("forge config should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("darwin".to_string()),
+            arch: Some("arm64".to_string()),
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.signing.macos.sign.will_execute);
+        assert_eq!(
+            report.signing.macos.sign.timestamp_url.as_deref(),
+            Some(APPLE_TIMESTAMP_URL)
+        );
+        assert!(report.signing.macos.sign.for_notarization);
+        assert_eq!(
+            report.signing.macos.notarize.auth_method.as_deref(),
+            Some("keychain-profile")
+        );
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ad-hoc signing is not notarizable")));
+
+        let settings = macos_signing_settings(&report).expect("signing settings should build");
+        assert!(settings.for_notarization());
+        assert_eq!(
+            settings.time_stamp_url().map(|url| url.as_str()),
+            Some(APPLE_TIMESTAMP_URL)
+        );
+
+        let json = serde_json::to_string(&report).expect("report should serialize");
+        assert!(!json.contains("P12_PASSWORD="));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn warns_when_macos_notarization_timestamp_is_disabled() {
+        let root = unique_temp_dir("macos-p12-notarization-no-timestamp");
+        write_package_json(&root);
+        fs::write(root.join("developer-id.p12"), "not a real p12")
+            .expect("p12 placeholder should be written");
+        fs::write(
+            root.join("forge.config.js"),
+            r#"
+            module.exports = {
+              packagerConfig: {
+                osxSign: {
+                  p12File: 'developer-id.p12',
+                  timestamp: 'none',
+                },
+                osxNotarize: {
+                  keychainProfile: 'notary-profile',
+                },
+              },
+            };
+            "#,
+        )
+        .expect("forge config should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("darwin".to_string()),
+            arch: Some("arm64".to_string()),
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.signing.macos.sign.will_execute);
+        assert!(report.signing.macos.sign.timestamp_url.is_none());
+        assert!(!report.signing.macos.sign.for_notarization);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("requires a secure timestamp")));
 
         let _ = fs::remove_dir_all(root);
     }
