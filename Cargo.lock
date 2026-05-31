@@ -1610,6 +1610,7 @@ dependencies = [
  "md5",
  "msi",
  "plist",
+ "regex",
  "rpm",
  "serde",
  "serde_json",

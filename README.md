@@ -35,7 +35,7 @@ The Rust-native flow currently owns:
 
 - `init --template minimal`: writes a local Electron starter without Electron Forge.
 - `start`: launches the installed Electron runtime directly.
-- `package`: copies the installed Electron runtime, app files, installed production dependency closure, app metadata, macOS icon, and extra resources into a local app bundle for the current platform and architecture; it reads package metadata from `package.json`, JSON-shaped Forge config, and static Forge config files, and can apply experimental Rust-native ad-hoc macOS bundle signatures.
+- `package`: copies the installed Electron runtime, app files, installed production dependency closure, app metadata, macOS icon, and extra resources into a local app bundle for the current platform and architecture; it reads package metadata and ignore rules from `package.json`, JSON-shaped Forge config, and static Forge config files, and can apply experimental Rust-native ad-hoc macOS bundle signatures.
 - `make`: runs `package` and writes distributables under `out/make/<target>/<platform>/<arch>/`; it reads JSON-shaped `config.forge.makers` / `electronCli.makers` arrays and static Forge config files when `--target` is omitted, and `--target` still forces one maker. ZIP works on all platforms, `--target dmg` writes a basic macOS disk image, `--target deb` / `--target rpm` write Linux packages, and `--target msi` writes a basic Windows Installer package.
 - `publish`: runs `make` and publishes distributables to a local directory with a manifest or to GitHub Releases; it reads JSON-shaped `config.forge.publishers` / `electronCli.publishers` arrays and static Forge config files when `--publisher` is omitted, and `--publisher` still forces one publisher.
 
@@ -56,6 +56,11 @@ Package metadata can be configured in `package.json`:
       "appCategoryType": "public.app-category.developer-tools",
       "icon": "assets/icon",
       "extraResource": "assets/config.json",
+      "ignore": [
+        "^/coverage(?:/|$)",
+        "^/dist-dev(?:/|$)",
+        "/^\\/fixtures(?:\\/|$)/"
+      ],
       "osxSign": {
         "p12File": "certs/developer-id.p12",
         "p12PasswordEnv": "ELECTRON_CLI_P12_PASSWORD",
@@ -104,7 +109,7 @@ Package metadata can be configured in `package.json`:
 
 Use `p12PasswordEnv`, `p12PasswordFile`, or `p12Password` for the `.p12` password; password values are not serialized in package reports. Set `osxSign.timestamp` to a timestamp server URL, `true` for Apple's default `http://timestamp.apple.com/ts01`, or `"none"` / `false` to disable timestamping. When `osxNotarize` is enabled with p12 signing, `electron-cli` automatically enables notarization-compatible signing and uses Apple's timestamp server unless timestamping is disabled explicitly. Rust-native notarization execution currently requires `appleApiKey`, `appleApiKeyId`, and `appleApiIssuer`; `appleApiKey` may point at the `.p8` file from App Store Connect or a unified API key JSON file. It waits up to `maxWaitSeconds` or 600 seconds by default and staples by default. Set `staple: false` to skip stapling, or set both `staple: false` and `wait: false` to submit without waiting. Set `identity` to a Developer ID certificate name when you want the plan to reflect Forge-style keychain release signing, but this project will report it as not executable until Rust-native keychain lookup exists. Use `identity: "-"` or omit `identity` for the current ad-hoc signing path.
 
-The package command also reads JSON-shaped `config.forge.packagerConfig` and `electronPackagerConfig` entries for the same fields. The make command maps JSON-shaped Forge maker names to the Rust-native targets it supports: zip, dmg, deb, rpm, and wix/msi. The publish command maps JSON-shaped publisher names to local and GitHub.
+The package command also reads JSON-shaped `config.forge.packagerConfig` and `electronPackagerConfig` entries for the same fields. `packagerConfig.ignore` accepts regex strings or JavaScript-style regex literal strings such as `"/^\\/coverage/i"`; patterns are matched against project-relative paths with and without a leading slash, plus the absolute source path. The ignore filter applies to copied app files and the copied production dependency closure, but not to the Electron runtime, icons, or explicit `extraResource` entries. The make command maps JSON-shaped Forge maker names to the Rust-native targets it supports: zip, dmg, deb, rpm, and wix/msi. The publish command maps JSON-shaped publisher names to local and GitHub.
 
 Static `forge.config.js`, `forge.config.cjs`, `forge.config.mjs`, and `forge.config.ts` files are parsed in Rust when they export an object literal directly or via a local `const`/`let`/`var` identifier. Dynamic JavaScript config that calls functions, reads environment state, or computes the config at runtime is not evaluated.
 

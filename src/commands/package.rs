@@ -14,6 +14,7 @@ use apple_codesign::{
 };
 use camino::Utf8PathBuf;
 use plist::{Dictionary as PlistDictionary, Value as PlistValue};
+use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
@@ -35,6 +36,7 @@ pub(crate) struct PackageReport {
     output_dir: Utf8PathBuf,
     bundle_dir: Utf8PathBuf,
     app_resources_dir: Utf8PathBuf,
+    ignore_patterns: Vec<String>,
     dry_run: bool,
     status: PackageStatus,
     create_dirs: Vec<Utf8PathBuf>,
@@ -165,6 +167,7 @@ struct PackagerConfig {
     app_copyright: Option<String>,
     icon: Vec<String>,
     extra_resource: Vec<String>,
+    ignore: Vec<String>,
     darwin_dark_mode_support: bool,
     osx_sign: MacosSignConfig,
     osx_notarize: MacosNotarizeConfig,
@@ -211,6 +214,8 @@ struct MacosNotarizeConfig {
     wait_timeout_seconds: Option<u64>,
     staple: Option<bool>,
 }
+
+struct IgnoreRule(Regex);
 
 pub fn run(args: PackageArgs) -> Result<()> {
     let snapshot = crate::project::inspect(&args.cwd)?;
@@ -300,6 +305,7 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
     warnings.extend(runtime_dependency_warnings(root, &snapshot));
     warnings.extend(metadata_warnings);
     warnings.extend(signing_warnings);
+    let _ = compile_ignore_rules(&package_config.packager.ignore, Some(&mut warnings));
 
     let create_dirs = vec![package_root.clone(), app_resources_dir.clone()];
     let mut copy_steps = vec![
@@ -337,6 +343,7 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         output_dir: utf8_path(output_dir)?,
         bundle_dir: utf8_path(bundle_dir)?,
         app_resources_dir: utf8_path(app_resources_dir)?,
+        ignore_patterns: package_config.packager.ignore,
         dry_run: args.dry_run,
         status: PackageStatus::Planned,
         create_dirs: create_dirs
@@ -385,6 +392,7 @@ pub(crate) fn execute_package(report: &PackageReport, force: bool) -> Result<()>
     let package_root = package_root(bundle_dir, &report.platform);
     let app_resources_dir = Path::new(report.app_resources_dir.as_str());
     let app_dir = app_resources_dir.join("app");
+    let ignore_rules = compile_ignore_rules(&report.ignore_patterns, None);
 
     if package_root.exists() {
         if force {
@@ -424,11 +432,14 @@ pub(crate) fn execute_package(report: &PackageReport, force: bool) -> Result<()>
         Path::new(report.project.root.as_str()),
         &app_dir,
         Path::new(report.output_dir.as_str()),
+        Path::new(report.project.root.as_str()),
+        &ignore_rules,
     )?;
     copy_runtime_dependencies(
         Path::new(report.project.root.as_str()),
         &app_dir,
         &report.project,
+        &ignore_rules,
     )?;
     execute_macos_signing(report)?;
     execute_macos_notarization(report)?;
@@ -808,6 +819,13 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
     for step in &report.copy_steps {
         println!("  {} -> {}", step.from, step.to);
     }
+    if !report.ignore_patterns.is_empty() {
+        println!();
+        println!("Ignore");
+        for pattern in &report.ignore_patterns {
+            println!("  {pattern}");
+        }
+    }
 
     if !report.warnings.is_empty() {
         println!();
@@ -870,6 +888,7 @@ fn parse_packager_config(value: &JsonValue) -> PackagerConfig {
         app_copyright: string_value(value, "appCopyright"),
         icon: string_list(value.get("icon")),
         extra_resource: string_list(value.get("extraResource")),
+        ignore: string_list(value.get("ignore")),
         darwin_dark_mode_support: value
             .get("darwinDarkModeSupport")
             .and_then(JsonValue::as_bool)
@@ -877,6 +896,87 @@ fn parse_packager_config(value: &JsonValue) -> PackagerConfig {
         osx_sign: parse_macos_sign_config(value.get("osxSign")),
         osx_notarize: parse_macos_notarize_config(value.get("osxNotarize")),
     }
+}
+
+fn compile_ignore_rules(
+    patterns: &[String],
+    mut warnings: Option<&mut Vec<String>>,
+) -> Vec<IgnoreRule> {
+    let mut rules = Vec::new();
+
+    for pattern in patterns {
+        match compile_ignore_pattern(pattern) {
+            Ok(regex) => rules.push(IgnoreRule(regex)),
+            Err(error) => {
+                if let Some(warnings) = warnings.as_deref_mut() {
+                    warnings.push(format!(
+                        "Configured packager ignore pattern is not a valid regex and will be skipped: {pattern}: {error}."
+                    ));
+                }
+            }
+        }
+    }
+
+    rules
+}
+
+fn compile_ignore_pattern(pattern: &str) -> Result<Regex> {
+    if let Some((body, flags)) = parse_js_regex_literal(pattern) {
+        let mut builder = RegexBuilder::new(body);
+        for flag in flags.chars() {
+            match flag {
+                'i' => {
+                    builder.case_insensitive(true);
+                }
+                'm' => {
+                    builder.multi_line(true);
+                }
+                's' => {
+                    builder.dot_matches_new_line(true);
+                }
+                'u' | 'g' | 'y' | 'd' => {}
+                _ => bail!("unsupported JavaScript regex flag '{flag}'"),
+            }
+        }
+        return builder
+            .build()
+            .context("could not compile JavaScript-style regex literal");
+    }
+
+    Regex::new(pattern).context("could not compile regex")
+}
+
+fn parse_js_regex_literal(pattern: &str) -> Option<(&str, &str)> {
+    if !pattern.starts_with('/') {
+        return None;
+    }
+
+    let mut escaped = false;
+    let mut last_slash = None;
+    for (index, char) in pattern.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if char == '\\' {
+            escaped = true;
+            continue;
+        }
+        if char == '/' {
+            last_slash = Some(index);
+        }
+    }
+
+    let slash = last_slash?;
+    let flags = &pattern[slash + 1..];
+    if !flags
+        .chars()
+        .all(|flag| matches!(flag, 'd' | 'g' | 'i' | 'm' | 's' | 'u' | 'y'))
+    {
+        return None;
+    }
+
+    Some((&pattern[1..slash], flags))
 }
 
 fn parse_macos_sign_config(value: Option<&JsonValue>) -> MacosSignConfig {
@@ -1595,7 +1695,13 @@ fn default_bundle_identifier(artifact_name: &str) -> String {
     format!("com.electron.{component}")
 }
 
-fn copy_project_files(source: &Path, destination: &Path, output_dir: &Path) -> Result<()> {
+fn copy_project_files(
+    source: &Path,
+    destination: &Path,
+    output_dir: &Path,
+    project_root: &Path,
+    ignore_rules: &[IgnoreRule],
+) -> Result<()> {
     for entry in
         fs::read_dir(source).with_context(|| format!("Could not read {}", source.display()))?
     {
@@ -1604,13 +1710,21 @@ fn copy_project_files(source: &Path, destination: &Path, output_dir: &Path) -> R
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
 
-        if should_skip_project_entry(&source_path, &file_name, output_dir) {
+        if should_skip_project_entry(&source_path, &file_name, output_dir)
+            || should_ignore_path(&source_path, project_root, ignore_rules)
+        {
             continue;
         }
 
         let destination_path = destination.join(file_name.as_ref());
         if source_path.is_dir() {
-            copy_project_files(&source_path, &destination_path, output_dir)?;
+            copy_project_files(
+                &source_path,
+                &destination_path,
+                output_dir,
+                project_root,
+                ignore_rules,
+            )?;
         } else {
             if let Some(parent) = destination_path.parent() {
                 fs::create_dir_all(parent)
@@ -1640,6 +1754,7 @@ fn copy_runtime_dependencies(
     root: &Path,
     app_dir: &Path,
     snapshot: &ProjectSnapshot,
+    ignore_rules: &[IgnoreRule],
 ) -> Result<()> {
     if !has_runtime_dependencies(snapshot) {
         return Ok(());
@@ -1691,6 +1806,9 @@ fn copy_runtime_dependencies(
         if !copied_paths.insert(canonical_package_dir.clone()) {
             continue;
         }
+        if should_ignore_path(&canonical_package_dir, root, ignore_rules) {
+            continue;
+        }
 
         let relative_path = canonical_package_dir
             .strip_prefix(&canonical_root_node_modules)
@@ -1702,13 +1820,14 @@ fn copy_runtime_dependencies(
                 )
             })?;
         let destination = app_node_modules.join(relative_path);
-        copy_recursively(&canonical_package_dir, &destination).with_context(|| {
-            format!(
-                "Could not copy runtime dependency {} to {}",
-                canonical_package_dir.display(),
-                destination.display()
-            )
-        })?;
+        copy_recursively_with_ignore(&canonical_package_dir, &destination, root, ignore_rules)
+            .with_context(|| {
+                format!(
+                    "Could not copy runtime dependency {} to {}",
+                    canonical_package_dir.display(),
+                    destination.display()
+                )
+            })?;
 
         let package_json = read_dependency_package_json(&canonical_package_dir)?;
         for name in string_map(package_json.get("dependencies")).keys() {
@@ -1927,6 +2046,92 @@ fn copy_recursively(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn copy_recursively_with_ignore(
+    source: &Path,
+    destination: &Path,
+    project_root: &Path,
+    ignore_rules: &[IgnoreRule],
+) -> Result<()> {
+    if should_ignore_path(source, project_root, ignore_rules) {
+        return Ok(());
+    }
+
+    if source.is_dir() {
+        fs::create_dir_all(destination)
+            .with_context(|| format!("Could not create {}", destination.display()))?;
+
+        for entry in
+            fs::read_dir(source).with_context(|| format!("Could not read {}", source.display()))?
+        {
+            let entry = entry?;
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            copy_recursively_with_ignore(
+                &source_path,
+                &destination_path,
+                project_root,
+                ignore_rules,
+            )?;
+        }
+    } else {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Could not create {}", parent.display()))?;
+        }
+        fs::copy(source, destination).with_context(|| {
+            format!(
+                "Could not copy {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn should_ignore_path(path: &Path, project_root: &Path, ignore_rules: &[IgnoreRule]) -> bool {
+    if ignore_rules.is_empty() {
+        return false;
+    }
+
+    let candidates = ignore_match_candidates(path, project_root);
+    ignore_rules.iter().any(|rule| {
+        candidates
+            .iter()
+            .any(|candidate| rule.0.is_match(candidate))
+    })
+}
+
+fn ignore_match_candidates(path: &Path, project_root: &Path) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let is_dir = path.is_dir();
+
+    if let Ok(relative) = path.strip_prefix(project_root) {
+        let relative = path_to_forward_slashes(relative);
+        if !relative.is_empty() {
+            candidates.push(relative.clone());
+            candidates.push(format!("/{relative}"));
+            if is_dir {
+                candidates.push(format!("{relative}/"));
+                candidates.push(format!("/{relative}/"));
+            }
+        }
+    }
+
+    let absolute = path_to_forward_slashes(path);
+    candidates.push(absolute.clone());
+    if is_dir {
+        candidates.push(format!("{absolute}/"));
+    }
+
+    candidates
+}
+
+fn path_to_forward_slashes(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 fn should_skip_project_entry(source_path: &Path, file_name: &str, output_dir: &Path) -> bool {
     if matches!(file_name, ".git" | "node_modules" | "target") {
         return true;
@@ -2126,6 +2331,9 @@ impl PackagerConfig {
         if !other.extra_resource.is_empty() {
             self.extra_resource = other.extra_resource;
         }
+        if !other.ignore.is_empty() {
+            self.ignore = other.ignore;
+        }
         self.darwin_dark_mode_support =
             other.darwin_dark_mode_support || self.darwin_dark_mode_support;
         if other.osx_sign.configured {
@@ -2298,6 +2506,157 @@ mod tests {
         assert!(app_node_modules.join("dep-a/package.json").exists());
         assert!(app_node_modules.join("dep-b/package.json").exists());
         assert!(!app_node_modules.join("dev-only").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn packages_respect_packager_ignore_patterns() {
+        let root = unique_temp_dir("ignore-patterns");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name":"starter-app",
+                "version":"0.1.0",
+                "main":"src/main.js",
+                "devDependencies":{"electron":"30.0.0"},
+                "electronCli":{
+                    "packagerConfig":{
+                        "ignore":[
+                            "^/src/ignored\\.js$",
+                            "^/build(?:/|$)",
+                            "/^\\/coverage(?:\\/|$)/"
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        fs::write(root.join("src/ignored.js"), "console.log('ignore');")
+            .expect("ignored source should be written");
+        fs::create_dir_all(root.join("build")).expect("build dir should be created");
+        fs::write(root.join("build/generated.js"), "console.log('ignore');")
+            .expect("ignored build file should be written");
+        fs::create_dir_all(root.join("coverage")).expect("coverage dir should be created");
+        fs::write(root.join("coverage/report.txt"), "ignore")
+            .expect("ignored coverage file should be written");
+        write_fake_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert_eq!(report.ignore_patterns.len(), 3);
+        assert!(report.warnings.is_empty());
+        execute_package(&report, false).expect("package should succeed");
+
+        let app_dir = Path::new(report.app_resources_dir.as_str()).join("app");
+        assert!(app_dir.join("src/main.js").exists());
+        assert!(!app_dir.join("src/ignored.js").exists());
+        assert!(!app_dir.join("build").exists());
+        assert!(!app_dir.join("coverage").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn packages_respect_packager_ignore_patterns_inside_runtime_dependencies() {
+        let root = unique_temp_dir("ignore-runtime-deps");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name":"starter-app",
+                "version":"0.1.0",
+                "main":"src/main.js",
+                "dependencies":{"dep-a":"1.0.0"},
+                "devDependencies":{"electron":"30.0.0"},
+                "electronCli":{
+                    "packagerConfig":{
+                        "ignore":["^/node_modules/dep-a/test(?:/|$)"]
+                    }
+                }
+            }"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+        write_dependency_package(&root, "dep-a", r#"{"name":"dep-a","version":"1.0.0"}"#);
+        let dep_test_dir = root.join("node_modules/dep-a/test");
+        fs::create_dir_all(&dep_test_dir).expect("dependency test dir should be created");
+        fs::write(dep_test_dir.join("fixture.js"), "module.exports = true;")
+            .expect("dependency test fixture should be written");
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.warnings.is_empty());
+        execute_package(&report, false).expect("package should succeed");
+
+        let app_node_modules = Path::new(report.app_resources_dir.as_str())
+            .join("app")
+            .join("node_modules");
+        assert!(app_node_modules.join("dep-a/package.json").exists());
+        assert!(app_node_modules.join("dep-a/index.js").exists());
+        assert!(!app_node_modules.join("dep-a/test").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_packager_ignore_pattern_is_reported_and_skipped() {
+        let root = unique_temp_dir("invalid-ignore-pattern");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name":"starter-app",
+                "version":"0.1.0",
+                "main":"src/main.js",
+                "devDependencies":{"electron":"30.0.0"},
+                "electronCli":{"packagerConfig":{"ignore":["["]}}
+            }"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning
+                .contains("Configured packager ignore pattern is not a valid regex")));
 
         let _ = fs::remove_dir_all(root);
     }
