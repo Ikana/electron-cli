@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod forge_config;
 mod output;
 mod project;
 

@@ -1,6 +1,6 @@
 [package]
 name = "electron-cli"
-version = "0.3.0-alpha.14"
+version = "0.3.0-alpha.15"
 edition = "2021"
 description = "Experimental Rust CLI for Electron project diagnostics and workflow automation"
 license = "MIT"
@@ -15,6 +15,7 @@ clap = { version = "4.6", features = ["derive"] }
 fatfs = "0.3"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 fscommon = "0.1"
+json5 = "1"
 md5 = "0.7"
 msi = "0.10"
 plist = "1"

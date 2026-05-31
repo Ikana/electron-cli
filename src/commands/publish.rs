@@ -449,24 +449,15 @@ fn resolved_publisher_from_args(
 }
 
 fn configured_publishers(project: &ProjectSnapshot) -> Result<Vec<ConfiguredPublisher>> {
-    let Some(package_json_path) = &project.package_json else {
-        return Ok(Vec::new());
-    };
-    let package_json_path = Path::new(package_json_path.as_str());
-    let raw = fs::read_to_string(package_json_path)
-        .with_context(|| format!("Could not read {}", package_json_path.display()))?;
-    let package = serde_json::from_str::<JsonValue>(&raw)
-        .with_context(|| format!("Could not parse {}", package_json_path.display()))?;
+    let project_config = crate::forge_config::read(project)?;
 
     let mut publishers = Vec::new();
     for value in [
-        package
-            .get("config")
-            .and_then(|config| config.get("forge"))
+        project_config
+            .forge()
             .and_then(|forge| forge.get("publishers")),
-        package
-            .get("electronCli")
-            .or_else(|| package.get("electron-cli"))
+        project_config
+            .electron_cli()
             .and_then(|config| config.get("publishers")),
     ]
     .into_iter()
@@ -1390,6 +1381,46 @@ mod tests {
         assert!(github.draft);
         assert!(github.prerelease);
         assert_eq!(github.api_url, "http://127.0.0.1:9");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builds_github_publish_report_from_static_forge_config_js() {
+        let root = unique_temp_dir("configured-github-js-plan");
+        write_package_json(&root);
+        fs::write(
+            root.join("forge.config.js"),
+            r#"
+            module.exports = {
+              publishers: [
+                {
+                  name: '@electron-forge/publisher-github',
+                  config: {
+                    repository: { owner: 'Ikana', name: 'electron-cli' },
+                    tagPrefix: 'release-',
+                    prerelease: true,
+                  },
+                },
+              ],
+            };
+            "#,
+        )
+        .expect("forge config should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let mut args = publish_args(root.clone(), true);
+        args.publisher = None;
+        args.github_api_url = None;
+        args.channel = None;
+        let report = build_report(&args).expect("report should build");
+
+        assert_eq!(report.publisher, "github");
+        let github = report.github.as_ref().expect("github plan should exist");
+        assert_eq!(github.repo, "Ikana/electron-cli");
+        assert_eq!(github.tag, "release-0.1.0");
+        assert!(github.prerelease);
 
         let _ = fs::remove_dir_all(root);
     }

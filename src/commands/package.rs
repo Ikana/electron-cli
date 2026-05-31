@@ -67,6 +67,7 @@ struct PackageJsonConfig {
     product_name: Option<String>,
     app_version: Option<String>,
     packager: PackagerConfig,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -133,7 +134,7 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         &platform,
     )?;
 
-    let mut warnings = Vec::new();
+    let mut warnings = package_config.warnings.clone();
     if snapshot.package_json.is_none() {
         warnings.push("No package.json found.".to_string());
     }
@@ -346,44 +347,40 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
 }
 
 fn read_package_json_config(snapshot: &ProjectSnapshot) -> Result<PackageJsonConfig> {
-    let Some(package_json_path) = &snapshot.package_json else {
-        return Ok(PackageJsonConfig::default());
-    };
-
-    let package_json_path = Path::new(package_json_path.as_str());
-    let raw = fs::read_to_string(package_json_path)
-        .with_context(|| format!("Could not read {}", package_json_path.display()))?;
-    let package = serde_json::from_str::<JsonValue>(&raw)
-        .with_context(|| format!("Could not parse {}", package_json_path.display()))?;
+    let project_config = crate::forge_config::read(snapshot)?;
 
     let mut packager = PackagerConfig::default();
-    if let Some(config) = package
-        .get("config")
-        .and_then(|config| config.get("forge"))
+    if let Some(config) = project_config
+        .forge()
         .and_then(|forge| forge.get("packagerConfig"))
     {
         packager.merge(parse_packager_config(config));
     }
-    if let Some(config) = package.get("electronPackagerConfig") {
+    if let Some(config) = project_config
+        .package()
+        .and_then(|package| package.get("electronPackagerConfig"))
+    {
         packager.merge(parse_packager_config(config));
     }
-    if let Some(config) = package
-        .get("electronCli")
-        .or_else(|| package.get("electron-cli"))
+    if let Some(config) = project_config
+        .electron_cli()
         .and_then(|config| config.get("packagerConfig"))
     {
         packager.merge(parse_packager_config(config));
     }
 
     Ok(PackageJsonConfig {
-        product_name: package
-            .get("productName")
+        product_name: project_config
+            .package()
+            .and_then(|package| package.get("productName"))
             .and_then(JsonValue::as_str)
             .map(ToOwned::to_owned),
-        app_version: package
-            .get("version")
+        app_version: project_config
+            .package()
+            .and_then(|package| package.get("version"))
             .and_then(JsonValue::as_str)
             .map(ToOwned::to_owned),
+        warnings: project_config.warnings().to_vec(),
         packager,
     })
 }
@@ -1376,6 +1373,52 @@ mod tests {
             assert!(report.metadata.icon.is_some());
             assert!(report.warnings.is_empty());
         }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plans_packager_metadata_from_forge_config_js() {
+        let root = unique_temp_dir("forge-config-metadata");
+        write_package_json(&root);
+        fs::write(
+            root.join("forge.config.js"),
+            r#"
+            module.exports = {
+              packagerConfig: {
+                name: 'Forge Config App',
+                executableName: 'ForgeExec',
+                appBundleId: 'com.example.forge-config',
+              },
+            };
+            "#,
+        )
+        .expect("forge config should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert_eq!(report.app_name, "Forge Config App");
+        assert_eq!(
+            report.executable_name,
+            executable_name("ForgeExec", &report.platform)
+        );
+        assert_eq!(
+            report.metadata.bundle_identifier,
+            "com.example.forge-config"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

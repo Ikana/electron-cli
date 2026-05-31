@@ -228,24 +228,13 @@ fn resolve_make_targets(
 }
 
 fn configured_makers(snapshot: &ProjectSnapshot) -> Result<Vec<ConfiguredMaker>> {
-    let Some(package_json_path) = &snapshot.package_json else {
-        return Ok(Vec::new());
-    };
-    let package_json_path = Path::new(package_json_path.as_str());
-    let raw = fs::read_to_string(package_json_path)
-        .with_context(|| format!("Could not read {}", package_json_path.display()))?;
-    let package = serde_json::from_str::<JsonValue>(&raw)
-        .with_context(|| format!("Could not parse {}", package_json_path.display()))?;
+    let project_config = crate::forge_config::read(snapshot)?;
 
     let mut makers = Vec::new();
     for value in [
-        package
-            .get("config")
-            .and_then(|config| config.get("forge"))
-            .and_then(|forge| forge.get("makers")),
-        package
-            .get("electronCli")
-            .or_else(|| package.get("electron-cli"))
+        project_config.forge().and_then(|forge| forge.get("makers")),
+        project_config
+            .electron_cli()
             .and_then(|config| config.get("makers")),
     ]
     .into_iter()
@@ -2417,6 +2406,46 @@ mod tests {
             .warnings()
             .iter()
             .any(|warning| warning.contains("@electron-forge/maker-squirrel")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builds_make_reports_from_static_forge_config_js() {
+        let root = unique_temp_dir("configured-makers-js");
+        write_package_json(&root);
+        fs::write(
+            root.join("forge.config.js"),
+            r#"
+            module.exports = {
+              makers: [
+                { name: '@electron-forge/maker-zip' },
+                { name: '@electron-forge/maker-rpm', platforms: ['linux'] },
+              ],
+            };
+            "#,
+        )
+        .expect("forge config should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("linux".to_string()),
+            arch: Some("x64".to_string()),
+            target: None,
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let reports = build_reports(&args).expect("reports should build");
+
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].target(), "zip");
+        assert_eq!(reports[1].target(), "rpm");
 
         let _ = fs::remove_dir_all(root);
     }

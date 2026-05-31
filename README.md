@@ -35,9 +35,9 @@ The Rust-native flow currently owns:
 
 - `init --template minimal`: writes a local Electron starter without Electron Forge.
 - `start`: launches the installed Electron runtime directly.
-- `package`: copies the installed Electron runtime, app files, installed production dependency closure, app metadata, macOS icon, and extra resources into a local app bundle for the current platform and architecture.
-- `make`: runs `package` and writes distributables under `out/make/<target>/<platform>/<arch>/`; it reads JSON-shaped `config.forge.makers` / `electronCli.makers` arrays when `--target` is omitted, and `--target` still forces one maker. ZIP works on all platforms, `--target dmg` writes a basic macOS disk image, `--target deb` / `--target rpm` write Linux packages, and `--target msi` writes a basic Windows Installer package.
-- `publish`: runs `make` and publishes distributables to a local directory with a manifest or to GitHub Releases; it reads JSON-shaped `config.forge.publishers` / `electronCli.publishers` arrays when `--publisher` is omitted, and `--publisher` still forces one publisher.
+- `package`: copies the installed Electron runtime, app files, installed production dependency closure, app metadata, macOS icon, and extra resources into a local app bundle for the current platform and architecture; it reads package metadata from `package.json`, JSON-shaped Forge config, and static Forge config files.
+- `make`: runs `package` and writes distributables under `out/make/<target>/<platform>/<arch>/`; it reads JSON-shaped `config.forge.makers` / `electronCli.makers` arrays and static Forge config files when `--target` is omitted, and `--target` still forces one maker. ZIP works on all platforms, `--target dmg` writes a basic macOS disk image, `--target deb` / `--target rpm` write Linux packages, and `--target msi` writes a basic Windows Installer package.
+- `publish`: runs `make` and publishes distributables to a local directory with a manifest or to GitHub Releases; it reads JSON-shaped `config.forge.publishers` / `electronCli.publishers` arrays and static Forge config files when `--publisher` is omitted, and `--publisher` still forces one publisher.
 
 The GitHub publisher creates or reuses a release, uploads selected make artifacts, and can replace an existing asset with `--force`. It reads `GITHUB_TOKEN` or `GH_TOKEN` and can infer `OWNER/REPO` from package metadata, Forge GitHub publisher config, or `package.json` `repository`. You can also pass `--github-repo`.
 
@@ -87,7 +87,9 @@ Package metadata can be configured in `package.json`:
 }
 ```
 
-The package command also reads JSON-shaped `config.forge.packagerConfig` and `electronPackagerConfig` entries for the same fields. The make command maps JSON-shaped Forge maker names to the Rust-native targets it supports: zip, dmg, deb, rpm, and wix/msi. The publish command maps JSON-shaped publisher names to local and GitHub. JavaScript Forge config files are not evaluated.
+The package command also reads JSON-shaped `config.forge.packagerConfig` and `electronPackagerConfig` entries for the same fields. The make command maps JSON-shaped Forge maker names to the Rust-native targets it supports: zip, dmg, deb, rpm, and wix/msi. The publish command maps JSON-shaped publisher names to local and GitHub.
+
+Static `forge.config.js`, `forge.config.cjs`, `forge.config.mjs`, and `forge.config.ts` files are parsed in Rust when they export an object literal directly or via a local `const`/`let`/`var` identifier. Dynamic JavaScript config that calls functions, reads environment state, or computes the config at runtime is not evaluated.
 
 ## Install
 
