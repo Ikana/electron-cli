@@ -92,6 +92,14 @@ struct IconResource {
     to: Utf8PathBuf,
 }
 
+struct IconResolutionContext<'a> {
+    artifact_name: &'a str,
+    bundle_dir: &'a Path,
+    executable_name: &'a str,
+    app_resources_dir: &'a Path,
+    platform: &'a str,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct AsarPlan {
     configured: bool,
@@ -372,6 +380,8 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         root,
         &package_config,
         &artifact_name,
+        &bundle_dir,
+        &executable_name,
         &app_resources_dir,
         &platform,
     )?;
@@ -439,11 +449,13 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
             "packagerConfig.prune is false, but node_modules was not found; installed dependencies will not be bundled.".to_string(),
         );
     }
-    if let Some(icon) = &metadata.icon {
-        copy_steps.push((
-            Path::new(icon.from.as_str()).to_path_buf(),
-            Path::new(icon.to.as_str()).to_path_buf(),
-        ));
+    if platform != "win32" {
+        if let Some(icon) = &metadata.icon {
+            copy_steps.push((
+                Path::new(icon.from.as_str()).to_path_buf(),
+                Path::new(icon.to.as_str()).to_path_buf(),
+            ));
+        }
     }
     for resource in &metadata.extra_resources {
         copy_steps.push((
@@ -1484,18 +1496,20 @@ fn package_metadata(
     root: &Path,
     config: &PackageJsonConfig,
     artifact_name: &str,
+    bundle_dir: &Path,
+    executable_name: &str,
     app_resources_dir: &Path,
     platform: &str,
 ) -> Result<(PackageMetadata, Vec<String>)> {
     let mut warnings = Vec::new();
-    let icon = resolve_icon_resource(
-        root,
-        &config.packager.icon,
+    let icon_context = IconResolutionContext {
         artifact_name,
+        bundle_dir,
+        executable_name,
         app_resources_dir,
         platform,
-        &mut warnings,
-    )?;
+    };
+    let icon = resolve_icon_resource(root, &config.packager.icon, &icon_context, &mut warnings)?;
     let extra_resources = resolve_extra_resources(
         root,
         &config.packager.extra_resource,
@@ -1951,16 +1965,14 @@ fn macos_notarize_auth_method(config: &MacosNotarizeConfig) -> Option<String> {
 fn resolve_icon_resource(
     root: &Path,
     configured_icons: &[String],
-    artifact_name: &str,
-    app_resources_dir: &Path,
-    platform: &str,
+    context: &IconResolutionContext<'_>,
     warnings: &mut Vec<String>,
 ) -> Result<Option<IconResource>> {
     let candidates = configured_icons
         .iter()
-        .filter_map(|icon| icon_candidate(root, icon, platform))
+        .filter_map(|icon| icon_candidate(root, icon, context.platform))
         .collect::<Vec<_>>();
-    let source = if platform == "darwin" {
+    let source = if context.platform == "darwin" {
         candidates
             .iter()
             .find(|candidate| candidate.exists() && path_extension(candidate) == Some("icns"))
@@ -1979,30 +1991,32 @@ fn resolve_icon_resource(
     };
     let Some(source) = source else {
         if let Some(first) = configured_icons.first() {
-            let expected = icon_candidate(root, first, platform)
+            let expected = icon_candidate(root, first, context.platform)
                 .unwrap_or_else(|| resolve_project_path(root, first));
             warnings.push(format!(
-                "Configured icon was not found for {platform}: {}.",
+                "Configured icon was not found for {}: {}.",
+                context.platform,
                 expected.display()
             ));
         }
         return Ok(None);
     };
 
-    if platform == "darwin" && path_extension(&source) == Some("icon") {
+    if context.platform == "darwin" && path_extension(&source) == Some("icon") {
         warnings.push(
             "macOS .icon files are not applied yet; provide an .icns icon for now.".to_string(),
         );
         return Ok(None);
     }
 
-    if platform == "win32" {
-        warnings.push("Windows executable icon embedding is not implemented yet.".to_string());
-        return Ok(None);
-    }
-
     let extension = path_extension(&source).unwrap_or("icns");
-    let destination = app_resources_dir.join(format!("{artifact_name}.{extension}"));
+    let destination = if context.platform == "win32" {
+        context.bundle_dir.join(context.executable_name)
+    } else {
+        context
+            .app_resources_dir
+            .join(format!("{}.{extension}", context.artifact_name))
+    };
 
     Ok(Some(IconResource {
         from: utf8_path(source)?,
@@ -3025,9 +3039,46 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
 fn apply_package_metadata(report: &PackageReport) -> Result<()> {
     if report.platform == "darwin" {
         apply_macos_metadata(report)?;
+    } else if report.platform == "win32" {
+        apply_windows_metadata(report)?;
     }
 
     Ok(())
+}
+
+fn apply_windows_metadata(report: &PackageReport) -> Result<()> {
+    let Some(icon) = &report.metadata.icon else {
+        return Ok(());
+    };
+
+    apply_windows_executable_icon(Path::new(icon.to.as_str()), Path::new(icon.from.as_str()))
+}
+
+fn apply_windows_executable_icon(executable: &Path, icon: &Path) -> Result<()> {
+    let icon_data = fs::read(icon)
+        .with_context(|| format!("Could not read Windows icon {}", icon.display()))?;
+    let mut image = editpe::Image::parse_file(executable).with_context(|| {
+        format!(
+            "Could not parse Windows executable for icon embedding: {}",
+            executable.display()
+        )
+    })?;
+    let mut resources = image.resource_directory().cloned().unwrap_or_default();
+    resources
+        .remove_main_icon()
+        .context("Could not remove existing Windows executable icon resource")?;
+    resources
+        .set_main_icon(icon_data)
+        .with_context(|| format!("Could not parse Windows icon {}", icon.display()))?;
+    image
+        .set_resource_directory(resources)
+        .context("Could not update Windows executable resources")?;
+    image.write_file(executable).with_context(|| {
+        format!(
+            "Could not write Windows executable with embedded icon: {}",
+            executable.display()
+        )
+    })
 }
 
 fn apply_macos_metadata(report: &PackageReport) -> Result<()> {
@@ -3315,9 +3366,11 @@ fn set_plist_string(dictionary: &mut PlistDictionary, key: &str, value: &str) {
 }
 
 fn copy_package_resources(report: &PackageReport) -> Result<()> {
-    if let Some(icon) = &report.metadata.icon {
-        copy_recursively(Path::new(icon.from.as_str()), Path::new(icon.to.as_str()))
-            .with_context(|| format!("Could not copy icon to {}", icon.to))?;
+    if report.platform != "win32" {
+        if let Some(icon) = &report.metadata.icon {
+            copy_recursively(Path::new(icon.from.as_str()), Path::new(icon.to.as_str()))
+                .with_context(|| format!("Could not copy icon to {}", icon.to))?;
+        }
     }
 
     for resource in &report.metadata.extra_resources {
@@ -4622,6 +4675,71 @@ mod tests {
     }
 
     #[test]
+    fn plans_windows_icon_embedding_from_packager_icon() {
+        let root = unique_temp_dir("windows-icon-plan");
+        write_metadata_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+        write_icon_and_resource_files(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("win32".to_string()),
+            arch: None,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        let icon = report
+            .metadata
+            .icon
+            .as_ref()
+            .expect("Windows icon should be planned");
+        assert!(icon.from.as_str().ends_with("assets/starter.ico"));
+        assert!(icon.to.as_str().ends_with(report.executable_name.as_str()));
+        assert!(!report
+            .copy_steps
+            .iter()
+            .any(|step| step.from == icon.from || step.to == icon.to));
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Windows executable icon embedding")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn embeds_windows_icon_into_portable_executable() {
+        let root = unique_temp_dir("windows-icon-embed");
+        fs::create_dir_all(root.join("assets")).expect("assets should be created");
+        let executable = root.join("starter.exe");
+        let icon = root.join("assets/starter.ico");
+        write_minimal_pe_executable(&executable);
+        fs::write(&icon, minimal_ico()).expect("icon should be written");
+
+        apply_windows_executable_icon(&executable, &icon).expect("icon should be embedded");
+
+        let image = editpe::Image::parse_file(&executable).expect("executable should parse");
+        let resources = image
+            .resource_directory()
+            .expect("resource directory should exist");
+        assert_eq!(
+            resources
+                .get_main_icon()
+                .expect("main icon should be readable"),
+            Some(b"icon-data".as_slice())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn applies_macos_extend_info_protocols_and_usage_descriptions() {
         let root = unique_temp_dir("macos-info-plist-metadata");
         fs::write(
@@ -5776,7 +5894,109 @@ mod tests {
     fn write_icon_and_resource_files(root: &Path) {
         fs::create_dir_all(root.join("assets")).expect("assets should be created");
         fs::write(root.join("assets/starter.icns"), b"icns").expect("icon should be written");
+        fs::write(root.join("assets/starter.ico"), minimal_ico()).expect("icon should be written");
         fs::write(root.join("assets/config.json"), "{}").expect("resource should be written");
+    }
+
+    fn minimal_ico() -> Vec<u8> {
+        let icon_data = b"icon-data";
+        let mut bytes = Vec::new();
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 1);
+        push_u16(&mut bytes, 1);
+        bytes.push(1);
+        bytes.push(1);
+        bytes.push(0);
+        bytes.push(0);
+        push_u16(&mut bytes, 1);
+        push_u16(&mut bytes, 32);
+        push_u32(&mut bytes, icon_data.len() as u32);
+        push_u32(&mut bytes, 22);
+        bytes.extend(icon_data);
+        bytes
+    }
+
+    fn write_minimal_pe_executable(path: &Path) {
+        let mut bytes = vec![0u8; 0x80];
+        bytes[0] = b'M';
+        bytes[1] = b'Z';
+        write_u32_at(&mut bytes, 0x3c, 0x80);
+
+        bytes.extend(b"PE\0\0");
+        push_u16(&mut bytes, 0x8664);
+        push_u16(&mut bytes, 1);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u16(&mut bytes, 0xf0);
+        push_u16(&mut bytes, 0x0022);
+
+        push_u16(&mut bytes, 0x20b);
+        bytes.push(14);
+        bytes.push(0);
+        push_u32(&mut bytes, 0x200);
+        push_u32(&mut bytes, 0x200);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0x1000);
+        push_u32(&mut bytes, 0x1000);
+
+        push_u64(&mut bytes, 0x140000000);
+        push_u32(&mut bytes, 0x1000);
+        push_u32(&mut bytes, 0x200);
+        push_u16(&mut bytes, 6);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 6);
+        push_u16(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0x2000);
+        push_u32(&mut bytes, 0x400);
+        push_u32(&mut bytes, 0);
+        push_u16(&mut bytes, 3);
+        push_u16(&mut bytes, 0x8160);
+        push_u64(&mut bytes, 0x100000);
+        push_u64(&mut bytes, 0x1000);
+        push_u64(&mut bytes, 0x100000);
+        push_u64(&mut bytes, 0x1000);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 16);
+        for _ in 0..16 {
+            push_u32(&mut bytes, 0);
+            push_u32(&mut bytes, 0);
+        }
+
+        bytes.extend(b".text\0\0\0");
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, 0x1000);
+        push_u32(&mut bytes, 0x200);
+        push_u32(&mut bytes, 0x400);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u32(&mut bytes, 0x60000020);
+
+        bytes.resize(0x400, 0);
+        bytes.push(0xc3);
+        bytes.resize(0x600, 0);
+        fs::write(path, bytes).expect("minimal PE should be written");
+    }
+
+    fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+        bytes.extend(value.to_le_bytes());
+    }
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend(value.to_le_bytes());
+    }
+
+    fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+        bytes.extend(value.to_le_bytes());
+    }
+
+    fn write_u32_at(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
     fn plist_string<'a>(dictionary: &'a PlistDictionary, key: &str) -> Option<&'a str> {

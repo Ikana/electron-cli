@@ -14,6 +14,7 @@ apple-dmg = "0.5"
 cab = "0.6"
 camino = { version = "1.1", features = ["serde1"] }
 clap = { version = "4.6", features = ["derive"] }
+editpe = { version = "0.2.3", default-features = false, features = ["std"] }
 fatfs = "0.3"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 fscommon = "0.1"
