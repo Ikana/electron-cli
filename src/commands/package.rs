@@ -35,6 +35,10 @@ pub(crate) struct PackageReport {
     project: ProjectSnapshot,
     app_name: String,
     executable_name: String,
+    #[serde(skip)]
+    author_name: Option<String>,
+    #[serde(skip)]
+    description: Option<String>,
     metadata: PackageMetadata,
     prune: bool,
     asar: AsarPlan,
@@ -216,6 +220,7 @@ enum PackageStatus {
 struct PackageJsonConfig {
     product_name: Option<String>,
     author_name: Option<String>,
+    description: Option<String>,
     app_version: Option<String>,
     packager: PackagerConfig,
     warnings: Vec<String>,
@@ -504,6 +509,8 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         project: snapshot,
         app_name,
         executable_name,
+        author_name: package_config.author_name.clone(),
+        description: package_config.description.clone(),
         metadata,
         prune,
         asar,
@@ -1126,6 +1133,11 @@ fn read_package_json_config(snapshot: &ProjectSnapshot) -> Result<PackageJsonCon
             .and_then(JsonValue::as_str)
             .map(ToOwned::to_owned),
         author_name: project_config.package().and_then(package_author_name),
+        description: project_config
+            .package()
+            .and_then(|package| package.get("description"))
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned),
         app_version: project_config
             .package()
             .and_then(|package| package.get("version"))
@@ -4812,6 +4824,14 @@ impl PackageReport {
 
     pub(crate) fn executable_name(&self) -> &str {
         &self.executable_name
+    }
+
+    pub(crate) fn author_name(&self) -> Option<&str> {
+        self.author_name.as_deref()
+    }
+
+    pub(crate) fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 
     pub(crate) fn artifact_stem(&self) -> String {

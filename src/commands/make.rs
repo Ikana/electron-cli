@@ -34,6 +34,8 @@ pub(crate) struct MakeReport {
     #[serde(skip)]
     target_kind: MakeTarget,
     linux_icon: Option<MakeIconResource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msi: Option<MsiMakerPlan>,
     skip_package: bool,
     dry_run: bool,
     make_dir: Utf8PathBuf,
@@ -58,12 +60,32 @@ struct ResolvedMakeTargets {
 struct ResolvedMakeTarget {
     target: MakeTarget,
     linux_icon: Option<String>,
+    msi: Option<MsiMakerConfig>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct MakeIconResource {
     from: Utf8PathBuf,
     to: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MsiMakerConfig {
+    description: Option<String>,
+    name: Option<String>,
+    version: Option<String>,
+    manufacturer: Option<String>,
+    exe: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MsiMakerPlan {
+    name: String,
+    version: String,
+    manufacturer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    exe: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,7 +159,6 @@ fn build_report_for_target(
         .join(target_kind.as_str())
         .join(package.platform())
         .join(package.arch());
-    let artifact = make_artifact_path(&make_dir, &package, target_kind);
 
     let mut warnings = package.warnings().to_vec();
     warnings.extend(config_warnings.iter().cloned());
@@ -167,24 +188,27 @@ fn build_report_for_target(
         ));
     }
 
-    if artifact.exists() && !args.force {
-        warnings.push(format!(
-            "Make artifact already exists: {}. Use --force to overwrite it.",
-            artifact.display()
-        ));
-    }
     let linux_icon = linux_icon_plan(
         &package,
         target_kind,
         target.linux_icon.as_deref(),
         &mut warnings,
     )?;
+    let msi = msi_maker_plan(&package, target_kind, target.msi.as_ref(), &mut warnings);
+    let artifact = make_artifact_path(&make_dir, &package, target_kind, msi.as_ref());
+    if artifact.exists() && !args.force {
+        warnings.push(format!(
+            "Make artifact already exists: {}. Use --force to overwrite it.",
+            artifact.display()
+        ));
+    }
 
     Ok(MakeReport {
         package,
         target: target_kind.as_str().to_string(),
         target_kind,
         linux_icon,
+        msi,
         skip_package: args.skip_package,
         dry_run: args.dry_run,
         make_dir: utf8_path(make_dir)?,
@@ -241,6 +265,77 @@ fn linux_icon_plan(
     }))
 }
 
+fn msi_maker_plan(
+    package: &PackageReport,
+    target: MakeTarget,
+    configured: Option<&MsiMakerConfig>,
+    warnings: &mut Vec<String>,
+) -> Option<MsiMakerPlan> {
+    if target != MakeTarget::Msi {
+        return None;
+    }
+
+    let configured = configured.cloned().unwrap_or_default();
+    let name = configured
+        .name
+        .as_deref()
+        .and_then(normalized_msi_text)
+        .unwrap_or_else(|| package.app_name().to_string());
+    let version = configured
+        .version
+        .as_deref()
+        .and_then(normalized_msi_text)
+        .or_else(|| {
+            package
+                .project()
+                .version
+                .as_deref()
+                .and_then(normalized_msi_text)
+        })
+        .unwrap_or_else(|| "0.1.0".to_string());
+    if version.contains('-') || version.contains('+') {
+        warnings.push(format!(
+            "MSI packages use Windows version format; maker-wix version \"{}\" will be transformed to \"{}\".",
+            version,
+            msi_product_version(Some(&version))
+        ));
+    }
+    let manufacturer = configured
+        .manufacturer
+        .as_deref()
+        .and_then(normalized_msi_text)
+        .or_else(|| package.author_name().and_then(normalized_msi_text))
+        .unwrap_or_else(|| "electron-cli".to_string());
+    let description = configured
+        .description
+        .as_deref()
+        .and_then(normalized_msi_text)
+        .or_else(|| package.description().and_then(normalized_msi_text));
+    let exe = configured
+        .exe
+        .as_deref()
+        .and_then(normalized_msi_text)
+        .unwrap_or_else(|| format!("{name}.exe"));
+
+    Some(MsiMakerPlan {
+        name,
+        version,
+        manufacturer,
+        description,
+        exe,
+    })
+}
+
+fn normalized_msi_text(value: &str) -> Option<String> {
+    let value = single_line(value);
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 fn linux_icon_candidate(root: &Path, configured_icon: &str) -> PathBuf {
     let path = resolve_project_path(root, configured_icon);
     if path.extension().is_some() {
@@ -264,6 +359,7 @@ struct ConfiguredMaker {
     target: Option<MakeTarget>,
     platforms: Vec<String>,
     linux_icon: Option<String>,
+    msi: Option<MsiMakerConfig>,
 }
 
 fn resolve_make_targets(
@@ -275,6 +371,7 @@ fn resolve_make_targets(
             targets: vec![ResolvedMakeTarget {
                 target,
                 linux_icon: None,
+                msi: None,
             }],
             warnings: Vec::new(),
         });
@@ -300,6 +397,7 @@ fn resolve_make_targets(
             targets.push(ResolvedMakeTarget {
                 target,
                 linux_icon: maker.linux_icon.clone(),
+                msi: maker.msi.clone(),
             });
         }
     }
@@ -309,6 +407,7 @@ fn resolve_make_targets(
             targets.push(ResolvedMakeTarget {
                 target: MakeTarget::Zip,
                 linux_icon: None,
+                msi: None,
             });
         } else {
             warnings.push(format!(
@@ -317,6 +416,7 @@ fn resolve_make_targets(
             targets.push(ResolvedMakeTarget {
                 target: MakeTarget::Zip,
                 linux_icon: None,
+                msi: None,
             });
         }
     }
@@ -357,6 +457,7 @@ fn parse_maker(value: &JsonValue) -> Option<ConfiguredMaker> {
             target: maker_target(label),
             platforms: Vec::new(),
             linux_icon: None,
+            msi: None,
         }),
         JsonValue::Object(object) => {
             let label = object
@@ -365,10 +466,16 @@ fn parse_maker(value: &JsonValue) -> Option<ConfiguredMaker> {
                 .or_else(|| object.get("maker"))
                 .and_then(JsonValue::as_str)?
                 .to_string();
+            let target = maker_target(&label);
             Some(ConfiguredMaker {
-                target: maker_target(&label),
+                target,
                 platforms: string_values(object.get("platforms")),
                 linux_icon: maker_linux_icon(object),
+                msi: if target == Some(MakeTarget::Msi) {
+                    Some(maker_wix_config(object))
+                } else {
+                    None
+                },
                 label,
             })
         }
@@ -394,6 +501,31 @@ fn maker_linux_icon(object: &serde_json::Map<String, JsonValue>) -> Option<Strin
         .and_then(JsonValue::as_str)
         .map(str::trim)
         .filter(|icon| !icon.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn maker_wix_config(object: &serde_json::Map<String, JsonValue>) -> MsiMakerConfig {
+    let config = object.get("config");
+    MsiMakerConfig {
+        description: maker_config_string(object, config, "description"),
+        name: maker_config_string(object, config, "name"),
+        version: maker_config_string(object, config, "version"),
+        manufacturer: maker_config_string(object, config, "manufacturer"),
+        exe: maker_config_string(object, config, "exe"),
+    }
+}
+
+fn maker_config_string(
+    object: &serde_json::Map<String, JsonValue>,
+    config: Option<&JsonValue>,
+    key: &str,
+) -> Option<String> {
+    config
+        .and_then(|config| config.get(key))
+        .or_else(|| object.get(key))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
 }
 
@@ -517,7 +649,14 @@ fn execute_make_artifact(report: &mut MakeReport, args: &MakeArgs) -> Result<()>
             write_deb_archive(&report.package, report.linux_icon.as_ref(), artifact)?
         }
         MakeTarget::Dmg => write_dmg_archive(&report.package, artifact)?,
-        MakeTarget::Msi => write_msi_archive(&report.package, artifact)?,
+        MakeTarget::Msi => write_msi_archive(
+            &report.package,
+            report
+                .msi
+                .as_ref()
+                .context("MSI maker plan was not resolved")?,
+            artifact,
+        )?,
         MakeTarget::Rpm => {
             write_rpm_archive(&report.package, report.linux_icon.as_ref(), artifact)?
         }
@@ -556,6 +695,17 @@ fn print_report(report: &MakeReport, json: bool) -> Result<()> {
     }
     if let Some(icon) = &report.linux_icon {
         println!("  linux icon: {} -> {}", icon.from, icon.to);
+    }
+    if let Some(msi) = &report.msi {
+        println!();
+        println!("MSI");
+        println!("  product name: {}", msi.name);
+        println!("  version: {}", msi.version);
+        println!("  manufacturer: {}", msi.manufacturer);
+        println!("  exe: {}", msi.exe);
+        if let Some(description) = &msi.description {
+            println!("  description: {description}");
+        }
     }
 
     if !report.warnings.is_empty() {
@@ -632,7 +782,12 @@ fn combined_warnings(reports: &[MakeReport]) -> Vec<String> {
     warnings
 }
 
-fn make_artifact_path(make_dir: &Path, package: &PackageReport, target: MakeTarget) -> PathBuf {
+fn make_artifact_path(
+    make_dir: &Path,
+    package: &PackageReport,
+    target: MakeTarget,
+    msi: Option<&MsiMakerPlan>,
+) -> PathBuf {
     match target {
         MakeTarget::Zip => make_dir.join(format!(
             "{}-{}-{}.zip",
@@ -652,12 +807,20 @@ fn make_artifact_path(make_dir: &Path, package: &PackageReport, target: MakeTarg
             dmg_version(package.project().version.as_deref()),
             package.arch()
         )),
-        MakeTarget::Msi => make_dir.join(format!(
-            "{}-{}-{}.msi",
-            package.artifact_stem(),
-            windows_artifact_version(package.project().version.as_deref()),
-            windows_arch(package.arch())
-        )),
+        MakeTarget::Msi => {
+            let artifact_name = msi
+                .map(|msi| package_name(&msi.name))
+                .unwrap_or_else(|| package.artifact_stem());
+            let version = msi
+                .map(|msi| windows_artifact_version(Some(&msi.version)))
+                .unwrap_or_else(|| windows_artifact_version(package.project().version.as_deref()));
+            make_dir.join(format!(
+                "{}-{}-{}.msi",
+                artifact_name,
+                version,
+                windows_arch(package.arch())
+            ))
+        }
         MakeTarget::Rpm => make_dir.join(format!(
             "{}-{}-1.{}.rpm",
             rpm_package_name(&package.artifact_stem()),
@@ -1147,7 +1310,7 @@ struct MsiFileEntry {
     sequence: i32,
 }
 
-fn write_msi_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
+fn write_msi_archive(package: &PackageReport, msi: &MsiMakerPlan, artifact: &Path) -> Result<()> {
     if package.platform() != "win32" {
         bail!(
             "MSI maker only supports Windows packages. Requested {}.",
@@ -1165,7 +1328,7 @@ fn write_msi_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
         .with_context(|| format!("Artifact path has no parent: {}", artifact.display()))?;
     fs::create_dir_all(parent).with_context(|| format!("Could not create {}", parent.display()))?;
 
-    let payload = collect_msi_payload(package, source)?;
+    let payload = collect_msi_payload(package, msi, source)?;
     if payload.files.is_empty() {
         bail!(
             "MSI maker requires at least one packaged file in {}",
@@ -1184,9 +1347,9 @@ fn write_msi_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
     let mut installer =
         Package::create(PackageType::Installer, file).context("Could not create MSI package")?;
 
-    write_msi_summary(&mut installer, package)?;
+    write_msi_summary(&mut installer, package, msi)?;
     create_msi_tables(&mut installer)?;
-    insert_msi_rows(&mut installer, package, &payload)?;
+    insert_msi_rows(&mut installer, package, msi, &payload)?;
     {
         let mut stream = installer
             .write_stream("app.cab")
@@ -1203,25 +1366,27 @@ fn write_msi_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_msi_summary(installer: &mut Package<File>, package: &PackageReport) -> Result<()> {
+fn write_msi_summary(
+    installer: &mut Package<File>,
+    package: &PackageReport,
+    msi: &MsiMakerPlan,
+) -> Result<()> {
+    let product_version = msi_product_version(Some(&msi.version));
     let package_code = deterministic_guid(
         "package-code",
-        &[
-            package.app_name(),
-            package.project().version.as_deref().unwrap_or("0.1.0"),
-            package.arch(),
-        ],
+        &[&msi.name, &product_version, package.arch()],
     );
     let arch = msi_summary_arch(package.arch());
     let language = Language::from_code(1033);
     let summary = installer.summary_info_mut();
-    summary.set_title(format!("{} Installer", package.app_name()));
-    summary.set_subject(package.app_name().to_string());
-    summary.set_author("electron-cli".to_string());
-    summary.set_comments(format!(
-        "{} packaged by electron-cli.",
-        single_line(package.app_name())
-    ));
+    summary.set_title(format!("{} Installer", msi.name));
+    summary.set_subject(msi.name.clone());
+    summary.set_author(msi.manufacturer.clone());
+    summary.set_comments(
+        msi.description
+            .clone()
+            .unwrap_or_else(|| format!("{} packaged by electron-cli.", single_line(&msi.name))),
+    );
     summary.set_creating_application("electron-cli".to_string());
     summary.set_uuid(package_code);
     summary.set_arch(arch.to_string());
@@ -1367,19 +1532,17 @@ fn create_msi_table(installer: &mut Package<File>, name: &str, columns: Vec<Colu
 fn insert_msi_rows(
     installer: &mut Package<File>,
     package: &PackageReport,
+    msi: &MsiMakerPlan,
     payload: &MsiPayload,
 ) -> Result<()> {
-    let product_version = msi_product_version(package.project().version.as_deref());
+    let product_version = msi_product_version(Some(&msi.version));
     let product_code = msi_guid(deterministic_guid(
         "product-code",
-        &[package.app_name(), &product_version, package.arch()],
+        &[&msi.name, &product_version, package.arch()],
     ));
     let upgrade_code = msi_guid(deterministic_guid(
         "upgrade-code",
-        &[
-            package.app_name(),
-            package.project().name.as_deref().unwrap_or(""),
-        ],
+        &[&msi.name, package.project().name.as_deref().unwrap_or("")],
     ));
     insert_msi_table_rows(
         installer,
@@ -1387,9 +1550,9 @@ fn insert_msi_rows(
         vec![
             vec![s("ProductCode"), s(product_code)],
             vec![s("ProductLanguage"), s("1033")],
-            vec![s("ProductName"), s(package.app_name())],
+            vec![s("ProductName"), s(&msi.name)],
             vec![s("ProductVersion"), s(product_version)],
-            vec![s("Manufacturer"), s("electron-cli")],
+            vec![s("Manufacturer"), s(&msi.manufacturer)],
             vec![s("UpgradeCode"), s(upgrade_code)],
             vec![s("ALLUSERS"), s("1")],
             vec![s("INSTALLLEVEL"), s("1")],
@@ -1397,7 +1560,7 @@ fn insert_msi_rows(
     )?;
 
     let program_files_dir = msi_program_files_directory(package.arch());
-    let install_folder = msi_filename("APPDIR", package.app_name());
+    let install_folder = msi_filename("APPDIR", &msi.name);
     insert_msi_table_rows(
         installer,
         "Directory",
@@ -1409,7 +1572,7 @@ fn insert_msi_rows(
             vec![
                 s("ApplicationProgramsFolder"),
                 s("ProgramMenuFolder"),
-                s(msi_filename("APPMENU", package.app_name())),
+                s(msi_filename("APPMENU", &msi.name)),
             ],
         ],
     )?;
@@ -1435,8 +1598,8 @@ fn insert_msi_rows(
         vec![vec![
             s("MainFeature"),
             Value::Null,
-            s(package.app_name()),
-            s(format!("Install {}.", single_line(package.app_name()))),
+            s(&msi.name),
+            s(format!("Install {}.", single_line(&msi.name))),
             Value::from(1),
             Value::from(1),
             s("INSTALLFOLDER"),
@@ -1514,11 +1677,14 @@ fn insert_msi_rows(
             vec![vec![
                 s("ApplicationShortcut"),
                 s("ApplicationProgramsFolder"),
-                s(msi_filename("SHORTCUT", package.app_name())),
+                s(msi_filename("SHORTCUT", &msi.name)),
                 s(component),
                 s(format!("[#{target_file}]")),
                 Value::Null,
-                s(format!("Launch {}.", single_line(package.app_name()))),
+                s(msi
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("Launch {}.", single_line(&msi.name)))),
                 Value::Null,
                 Value::Null,
                 Value::Null,
@@ -1598,7 +1764,11 @@ fn action_text(action: &str, description: &str, template: &str) -> Vec<Value> {
     vec![s(action), s(description), s(template)]
 }
 
-fn collect_msi_payload(package: &PackageReport, source: &Path) -> Result<MsiPayload> {
+fn collect_msi_payload(
+    package: &PackageReport,
+    msi: &MsiMakerPlan,
+    source: &Path,
+) -> Result<MsiPayload> {
     let mut payload = MsiPayload {
         directories: Vec::new(),
         files: Vec::new(),
@@ -1608,6 +1778,7 @@ fn collect_msi_payload(package: &PackageReport, source: &Path) -> Result<MsiPayl
     let mut directory_ids = BTreeMap::from([(PathBuf::new(), "INSTALLFOLDER".to_string())]);
     collect_msi_directory(
         package,
+        msi,
         source,
         Path::new(""),
         "INSTALLFOLDER",
@@ -1628,6 +1799,7 @@ fn collect_msi_payload(package: &PackageReport, source: &Path) -> Result<MsiPayl
 
 fn collect_msi_directory(
     package: &PackageReport,
+    msi: &MsiMakerPlan,
     source: &Path,
     relative_dir: &Path,
     directory_id: &str,
@@ -1663,6 +1835,7 @@ fn collect_msi_directory(
             });
             collect_msi_directory(
                 package,
+                msi,
                 &path,
                 &relative_path,
                 &dir_id,
@@ -1679,7 +1852,7 @@ fn collect_msi_directory(
             let component_guid = msi_guid(deterministic_guid(
                 "component",
                 &[
-                    package.app_name(),
+                    &msi.name,
                     package.project().name.as_deref().unwrap_or(""),
                     &relative_key,
                 ],
@@ -1696,7 +1869,7 @@ fn collect_msi_directory(
                 sequence: sequence as i32,
             };
 
-            if file_name.eq_ignore_ascii_case(package.executable_name()) {
+            if file_name.eq_ignore_ascii_case(&msi.exe) {
                 payload.shortcut_component = Some(component_id);
                 payload.shortcut_target_file = Some(file_id);
             }
@@ -2589,6 +2762,75 @@ mod tests {
     }
 
     #[test]
+    fn reads_configured_maker_wix_metadata() {
+        let root = unique_temp_dir("configured-maker-wix");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name":"starter-app",
+                "version":"0.1.0",
+                "description":"Package description",
+                "author":{"name":"Starter Corp"},
+                "license":"MIT",
+                "main":"src/main.js",
+                "devDependencies":{"electron":"30.0.0"},
+                "config":{"forge":{"makers":[
+                    {
+                        "name":"@electron-forge/maker-wix",
+                        "platforms":["win32"],
+                        "config":{
+                            "name":"Desk Suite",
+                            "version":"2.3.4-beta.1",
+                            "manufacturer":"Acme Tools",
+                            "description":"Desk workflows",
+                            "exe":"starter-app.exe"
+                        }
+                    }
+                ]}}
+            }"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("win32".to_string()),
+            arch: Some("x64".to_string()),
+            target: None,
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let report = build_report(&args).expect("report should build");
+        let msi = report.msi.as_ref().expect("msi plan should be resolved");
+
+        assert_eq!(report.target(), "msi");
+        assert_eq!(msi.name, "Desk Suite");
+        assert_eq!(msi.version, "2.3.4-beta.1");
+        assert_eq!(msi.manufacturer, "Acme Tools");
+        assert_eq!(msi.description.as_deref(), Some("Desk workflows"));
+        assert_eq!(msi.exe, "starter-app.exe");
+        assert!(Path::new(report.artifact.as_str()).ends_with(
+            PathBuf::from("out")
+                .join("make")
+                .join("msi")
+                .join("win32")
+                .join("x64")
+                .join("desk-suite-2.3.4-beta.1-x64.msi")
+        ));
+        assert!(report
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("will be transformed to \"2.3.4\"")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn builds_make_reports_from_static_forge_config_js() {
         let root = unique_temp_dir("configured-makers-js");
         write_package_json(&root);
@@ -2974,8 +3216,12 @@ mod tests {
             "starter-app.exe",
         );
 
-        write_msi_archive(&report.package, Path::new(report.artifact.as_str()))
-            .expect("msi should be written");
+        write_msi_archive(
+            &report.package,
+            report.msi.as_ref().expect("msi plan should exist"),
+            Path::new(report.artifact.as_str()),
+        )
+        .expect("msi should be written");
 
         let mut installer = msi::open(report.artifact.as_str()).expect("msi should parse");
         assert_eq!(installer.summary_info().arch(), Some("x64"));
@@ -3015,6 +3261,90 @@ mod tests {
             .read_to_string(&mut package_json)
             .expect("package.json cabinet entry should read");
         assert_eq!(package_json, "{}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn writes_msi_archive_with_maker_wix_metadata() {
+        let root = unique_temp_dir("msi-wix-metadata");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name":"starter-app",
+                "version":"0.1.0",
+                "description":"Package description",
+                "author":{"name":"Starter Corp"},
+                "license":"MIT",
+                "main":"src/main.js",
+                "devDependencies":{"electron":"30.0.0"},
+                "config":{"forge":{"makers":[
+                    {
+                        "name":"@electron-forge/maker-wix",
+                        "platforms":["win32"],
+                        "config":{
+                            "name":"Desk Suite",
+                            "version":"2.3.4-beta.1",
+                            "manufacturer":"Acme Tools",
+                            "description":"Desk workflows",
+                            "exe":"starter-app.exe"
+                        }
+                    }
+                ]}}
+            }"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("win32".to_string()),
+            arch: Some("x64".to_string()),
+            target: None,
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let report = build_report(&args).expect("report should build");
+        write_fake_windows_bundle(
+            Path::new(report.package.bundle_dir().as_str()),
+            "starter-app.exe",
+        );
+
+        write_msi_archive(
+            &report.package,
+            report.msi.as_ref().expect("msi plan should exist"),
+            Path::new(report.artifact.as_str()),
+        )
+        .expect("msi should be written");
+
+        let mut installer = msi::open(report.artifact.as_str()).expect("msi should parse");
+        assert_eq!(installer.summary_info().author(), Some("Acme Tools"));
+
+        let properties = msi_rows(&mut installer, "Property");
+        assert!(properties.contains(&vec![Value::from("ProductName"), Value::from("Desk Suite")]));
+        assert!(properties.contains(&vec![Value::from("ProductVersion"), Value::from("2.3.4")]));
+        assert!(properties.contains(&vec![
+            Value::from("Manufacturer"),
+            Value::from("Acme Tools")
+        ]));
+
+        let directories = msi_rows(&mut installer, "Directory");
+        assert!(directories.iter().any(|row| {
+            row[0] == Value::from("ApplicationProgramsFolder")
+                && row[2] == Value::from("APPMENU|Desk Suite")
+        }));
+
+        let shortcuts = msi_rows(&mut installer, "Shortcut");
+        assert!(shortcuts.iter().any(|row| {
+            row[2] == Value::from("SHORTCUT|Desk Suite")
+                && row[4] == Value::from("[#F0002]")
+                && row[6] == Value::from("Desk workflows")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
