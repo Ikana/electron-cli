@@ -76,6 +76,13 @@ struct MsiMakerConfig {
     version: Option<String>,
     manufacturer: Option<String>,
     exe: Option<String>,
+    language: Option<u16>,
+    program_files_folder_name: Option<String>,
+    shortcut_folder_name: Option<String>,
+    shortcut_name: Option<String>,
+    upgrade_code: Option<String>,
+    install_level: Option<i32>,
+    reboot_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -86,6 +93,13 @@ struct MsiMakerPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     exe: String,
+    language: u16,
+    program_files_folder_name: String,
+    shortcut_folder_name: String,
+    shortcut_name: String,
+    upgrade_code: String,
+    install_level: i32,
+    reboot_mode: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -316,6 +330,40 @@ fn msi_maker_plan(
         .as_deref()
         .and_then(normalized_msi_text)
         .unwrap_or_else(|| format!("{name}.exe"));
+    let language = configured.language.unwrap_or(1033);
+    let program_files_folder_name = configured
+        .program_files_folder_name
+        .as_deref()
+        .and_then(normalized_msi_text)
+        .unwrap_or_else(|| name.clone());
+    let shortcut_folder_name = configured
+        .shortcut_folder_name
+        .as_deref()
+        .and_then(normalized_msi_text)
+        .unwrap_or_else(|| manufacturer.clone());
+    let shortcut_name = configured
+        .shortcut_name
+        .as_deref()
+        .and_then(normalized_msi_text)
+        .unwrap_or_else(|| name.clone());
+    let upgrade_code = match configured.upgrade_code.as_deref() {
+        Some(value) => match parse_msi_guid(value) {
+            Some(uuid) => msi_guid(uuid),
+            None => {
+                warnings.push(format!(
+                    "maker-wix upgradeCode is not a valid UUID and will be ignored: {value}."
+                ));
+                default_msi_upgrade_code(package, &name)
+            }
+        },
+        None => default_msi_upgrade_code(package, &name),
+    };
+    let install_level = configured.install_level.unwrap_or(2);
+    let reboot_mode = configured
+        .reboot_mode
+        .as_deref()
+        .and_then(normalized_msi_text)
+        .unwrap_or_else(|| "ReallySuppress".to_string());
 
     Some(MsiMakerPlan {
         name,
@@ -323,6 +371,13 @@ fn msi_maker_plan(
         manufacturer,
         description,
         exe,
+        language,
+        program_files_folder_name,
+        shortcut_folder_name,
+        shortcut_name,
+        upgrade_code,
+        install_level,
+        reboot_mode,
     })
 }
 
@@ -334,6 +389,18 @@ fn normalized_msi_text(value: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+fn default_msi_upgrade_code(package: &PackageReport, name: &str) -> String {
+    msi_guid(deterministic_guid(
+        "upgrade-code",
+        &[name, package.project().name.as_deref().unwrap_or("")],
+    ))
+}
+
+fn parse_msi_guid(value: &str) -> Option<Uuid> {
+    let value = value.trim().trim_start_matches('{').trim_end_matches('}');
+    Uuid::parse_str(value).ok()
 }
 
 fn linux_icon_candidate(root: &Path, configured_icon: &str) -> PathBuf {
@@ -512,6 +579,13 @@ fn maker_wix_config(object: &serde_json::Map<String, JsonValue>) -> MsiMakerConf
         version: maker_config_string(object, config, "version"),
         manufacturer: maker_config_string(object, config, "manufacturer"),
         exe: maker_config_string(object, config, "exe"),
+        language: maker_config_u16(object, config, "language"),
+        program_files_folder_name: maker_config_string(object, config, "programFilesFolderName"),
+        shortcut_folder_name: maker_config_string(object, config, "shortcutFolderName"),
+        shortcut_name: maker_config_string(object, config, "shortcutName"),
+        upgrade_code: maker_config_string(object, config, "upgradeCode"),
+        install_level: maker_config_i32(object, config, "installLevel"),
+        reboot_mode: maker_config_string(object, config, "rebootMode"),
     }
 }
 
@@ -527,6 +601,36 @@ fn maker_config_string(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn maker_config_u16(
+    object: &serde_json::Map<String, JsonValue>,
+    config: Option<&JsonValue>,
+    key: &str,
+) -> Option<u16> {
+    let value = config
+        .and_then(|config| config.get(key))
+        .or_else(|| object.get(key))?;
+    match value {
+        JsonValue::Number(number) => number.as_u64().and_then(|number| number.try_into().ok()),
+        JsonValue::String(value) => value.trim().parse::<u16>().ok(),
+        _ => None,
+    }
+}
+
+fn maker_config_i32(
+    object: &serde_json::Map<String, JsonValue>,
+    config: Option<&JsonValue>,
+    key: &str,
+) -> Option<i32> {
+    let value = config
+        .and_then(|config| config.get(key))
+        .or_else(|| object.get(key))?;
+    match value {
+        JsonValue::Number(number) => number.as_i64().and_then(|number| number.try_into().ok()),
+        JsonValue::String(value) => value.trim().parse::<i32>().ok(),
+        _ => None,
+    }
 }
 
 fn maker_target(label: &str) -> Option<MakeTarget> {
@@ -703,6 +807,13 @@ fn print_report(report: &MakeReport, json: bool) -> Result<()> {
         println!("  version: {}", msi.version);
         println!("  manufacturer: {}", msi.manufacturer);
         println!("  exe: {}", msi.exe);
+        println!("  language: {}", msi.language);
+        println!("  install folder: {}", msi.program_files_folder_name);
+        println!("  shortcut folder: {}", msi.shortcut_folder_name);
+        println!("  shortcut name: {}", msi.shortcut_name);
+        println!("  upgrade code: {}", msi.upgrade_code);
+        println!("  install level: {}", msi.install_level);
+        println!("  reboot mode: {}", msi.reboot_mode);
         if let Some(description) = &msi.description {
             println!("  description: {description}");
         }
@@ -1377,7 +1488,7 @@ fn write_msi_summary(
         &[&msi.name, &product_version, package.arch()],
     );
     let arch = msi_summary_arch(package.arch());
-    let language = Language::from_code(1033);
+    let language = Language::from_code(msi.language);
     let summary = installer.summary_info_mut();
     summary.set_title(format!("{} Installer", msi.name));
     summary.set_subject(msi.name.clone());
@@ -1540,27 +1651,24 @@ fn insert_msi_rows(
         "product-code",
         &[&msi.name, &product_version, package.arch()],
     ));
-    let upgrade_code = msi_guid(deterministic_guid(
-        "upgrade-code",
-        &[&msi.name, package.project().name.as_deref().unwrap_or("")],
-    ));
     insert_msi_table_rows(
         installer,
         "Property",
         vec![
             vec![s("ProductCode"), s(product_code)],
-            vec![s("ProductLanguage"), s("1033")],
+            vec![s("ProductLanguage"), s(msi.language.to_string())],
             vec![s("ProductName"), s(&msi.name)],
             vec![s("ProductVersion"), s(product_version)],
             vec![s("Manufacturer"), s(&msi.manufacturer)],
-            vec![s("UpgradeCode"), s(upgrade_code)],
+            vec![s("UpgradeCode"), s(&msi.upgrade_code)],
             vec![s("ALLUSERS"), s("1")],
-            vec![s("INSTALLLEVEL"), s("1")],
+            vec![s("INSTALLLEVEL"), s(msi.install_level.to_string())],
+            vec![s("REBOOT"), s(&msi.reboot_mode)],
         ],
     )?;
 
     let program_files_dir = msi_program_files_directory(package.arch());
-    let install_folder = msi_filename("APPDIR", &msi.name);
+    let install_folder = msi_filename("APPDIR", &msi.program_files_folder_name);
     insert_msi_table_rows(
         installer,
         "Directory",
@@ -1572,7 +1680,7 @@ fn insert_msi_rows(
             vec![
                 s("ApplicationProgramsFolder"),
                 s("ProgramMenuFolder"),
-                s(msi_filename("APPMENU", &msi.name)),
+                s(msi_filename("APPMENU", &msi.shortcut_folder_name)),
             ],
         ],
     )?;
@@ -1601,7 +1709,7 @@ fn insert_msi_rows(
             s(&msi.name),
             s(format!("Install {}.", single_line(&msi.name))),
             Value::from(1),
-            Value::from(1),
+            Value::from(msi.install_level),
             s("INSTALLFOLDER"),
             Value::from(0),
         ]],
@@ -1677,7 +1785,7 @@ fn insert_msi_rows(
             vec![vec![
                 s("ApplicationShortcut"),
                 s("ApplicationProgramsFolder"),
-                s(msi_filename("SHORTCUT", &msi.name)),
+                s(msi_filename("SHORTCUT", &msi.shortcut_name)),
                 s(component),
                 s(format!("[#{target_file}]")),
                 Value::Null,
@@ -2783,7 +2891,14 @@ mod tests {
                             "version":"2.3.4-beta.1",
                             "manufacturer":"Acme Tools",
                             "description":"Desk workflows",
-                            "exe":"starter-app.exe"
+                            "exe":"starter-app.exe",
+                            "language":1043,
+                            "programFilesFolderName":"Desk Suite Install",
+                            "shortcutFolderName":"Desk Tools",
+                            "shortcutName":"Launch Desk",
+                            "upgradeCode":"11111111-2222-3333-4444-555555555555",
+                            "installLevel":4,
+                            "rebootMode":"Force"
                         }
                     }
                 ]}}
@@ -2814,6 +2929,13 @@ mod tests {
         assert_eq!(msi.manufacturer, "Acme Tools");
         assert_eq!(msi.description.as_deref(), Some("Desk workflows"));
         assert_eq!(msi.exe, "starter-app.exe");
+        assert_eq!(msi.language, 1043);
+        assert_eq!(msi.program_files_folder_name, "Desk Suite Install");
+        assert_eq!(msi.shortcut_folder_name, "Desk Tools");
+        assert_eq!(msi.shortcut_name, "Launch Desk");
+        assert_eq!(msi.upgrade_code, "{11111111-2222-3333-4444-555555555555}");
+        assert_eq!(msi.install_level, 4);
+        assert_eq!(msi.reboot_mode, "Force");
         assert!(Path::new(report.artifact.as_str()).ends_with(
             PathBuf::from("out")
                 .join("make")
@@ -3287,7 +3409,14 @@ mod tests {
                             "version":"2.3.4-beta.1",
                             "manufacturer":"Acme Tools",
                             "description":"Desk workflows",
-                            "exe":"starter-app.exe"
+                            "exe":"starter-app.exe",
+                            "language":1043,
+                            "programFilesFolderName":"Desk Suite Install",
+                            "shortcutFolderName":"Desk Tools",
+                            "shortcutName":"Launch Desk",
+                            "upgradeCode":"11111111-2222-3333-4444-555555555555",
+                            "installLevel":4,
+                            "rebootMode":"Force"
                         }
                     }
                 ]}}
@@ -3328,20 +3457,36 @@ mod tests {
         let properties = msi_rows(&mut installer, "Property");
         assert!(properties.contains(&vec![Value::from("ProductName"), Value::from("Desk Suite")]));
         assert!(properties.contains(&vec![Value::from("ProductVersion"), Value::from("2.3.4")]));
+        assert!(properties.contains(&vec![Value::from("ProductLanguage"), Value::from("1043")]));
         assert!(properties.contains(&vec![
             Value::from("Manufacturer"),
             Value::from("Acme Tools")
         ]));
+        assert!(properties.contains(&vec![
+            Value::from("UpgradeCode"),
+            Value::from("{11111111-2222-3333-4444-555555555555}")
+        ]));
+        assert!(properties.contains(&vec![Value::from("INSTALLLEVEL"), Value::from("4")]));
+        assert!(properties.contains(&vec![Value::from("REBOOT"), Value::from("Force")]));
+
+        let features = msi_rows(&mut installer, "Feature");
+        assert!(features
+            .iter()
+            .any(|row| row[0] == Value::from("MainFeature") && row[5] == Value::from(4)));
 
         let directories = msi_rows(&mut installer, "Directory");
         assert!(directories.iter().any(|row| {
+            row[0] == Value::from("INSTALLFOLDER")
+                && row[2] == Value::from("APPDIR|Desk Suite Install")
+        }));
+        assert!(directories.iter().any(|row| {
             row[0] == Value::from("ApplicationProgramsFolder")
-                && row[2] == Value::from("APPMENU|Desk Suite")
+                && row[2] == Value::from("APPMENU|Desk Tools")
         }));
 
         let shortcuts = msi_rows(&mut installer, "Shortcut");
         assert!(shortcuts.iter().any(|row| {
-            row[2] == Value::from("SHORTCUT|Desk Suite")
+            row[2] == Value::from("SHORTCUT|Launch Desk")
                 && row[4] == Value::from("[#F0002]")
                 && row[6] == Value::from("Desk workflows")
         }));
