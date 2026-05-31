@@ -5,7 +5,10 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use apple_codesign::{BundleSigner, CodeSignatureFlags, SettingsScope, SigningSettings};
+use apple_codesign::{
+    cryptography::{parse_pfx_data, PrivateKey},
+    BundleSigner, CodeSignatureFlags, SettingsScope, SigningSettings,
+};
 use camino::Utf8PathBuf;
 use plist::{Dictionary as PlistDictionary, Value as PlistValue};
 use serde::Serialize;
@@ -75,6 +78,12 @@ struct MacosSignPlan {
     will_execute: bool,
     method: Option<String>,
     identity: Option<String>,
+    p12_file: Option<Utf8PathBuf>,
+    p12_password_source: Option<String>,
+    p12_password_env: Option<String>,
+    p12_password_file: Option<Utf8PathBuf>,
+    #[serde(skip)]
+    p12_password: RedactedSecret,
     entitlements: Vec<Utf8PathBuf>,
     entitlements_inherit: Option<Utf8PathBuf>,
     hardened_runtime: Option<bool>,
@@ -88,6 +97,29 @@ struct MacosNotarizePlan {
     auth_method: Option<String>,
     keychain_profile: Option<String>,
     keychain: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct RedactedSecret(Option<String>);
+
+impl std::fmt::Debug for RedactedSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_some() {
+            formatter.write_str("<redacted>")
+        } else {
+            formatter.write_str("<unset>")
+        }
+    }
+}
+
+impl RedactedSecret {
+    fn new(value: Option<String>) -> Self {
+        Self(value)
+    }
+
+    fn as_deref(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -127,6 +159,10 @@ struct MacosSignConfig {
     enabled: bool,
     invalid_type: bool,
     identity: Option<String>,
+    p12_file: Option<String>,
+    p12_password: Option<String>,
+    p12_password_env: Option<String>,
+    p12_password_file: Option<String>,
     entitlements: Vec<String>,
     entitlements_inherit: Option<String>,
     hardened_runtime: Option<bool>,
@@ -409,15 +445,36 @@ fn execute_macos_signing(report: &PackageReport) -> Result<()> {
             .collect_nested_bundles()
             .context("Could not discover nested macOS bundles for signing")?;
 
-        let settings = macos_signing_settings(report)?;
-        signer
-            .write_signed_bundle(&signed_bundle_dir, &settings)
-            .with_context(|| {
-                format!(
-                    "Could not write signed macOS bundle to {}",
-                    signed_bundle_dir.display()
-                )
-            })?;
+        let mut settings = macos_signing_settings(report)?;
+        if let Some(p12_file) = &report.signing.macos.sign.p12_file {
+            let p12_path = Path::new(p12_file.as_str());
+            let p12_data = fs::read(p12_path)
+                .with_context(|| format!("Could not read {}", p12_path.display()))?;
+            let password = macos_p12_password(&report.signing.macos.sign)?;
+            let (certificate, signing_key) = parse_pfx_data(&p12_data, &password)
+                .with_context(|| format!("Could not parse {}", p12_path.display()))?;
+
+            settings.set_signing_key(signing_key.as_key_info_signer(), certificate);
+            settings.chain_apple_certificates();
+            settings.set_team_id_from_signing_certificate();
+            signer
+                .write_signed_bundle(&signed_bundle_dir, &settings)
+                .with_context(|| {
+                    format!(
+                        "Could not write signed macOS bundle to {}",
+                        signed_bundle_dir.display()
+                    )
+                })?;
+        } else {
+            signer
+                .write_signed_bundle(&signed_bundle_dir, &settings)
+                .with_context(|| {
+                    format!(
+                        "Could not write signed macOS bundle to {}",
+                        signed_bundle_dir.display()
+                    )
+                })?;
+        }
 
         Ok(())
     })();
@@ -441,7 +498,7 @@ fn execute_macos_signing(report: &PackageReport) -> Result<()> {
     Ok(())
 }
 
-fn macos_signing_settings(report: &PackageReport) -> Result<SigningSettings<'static>> {
+fn macos_signing_settings<'key>(report: &PackageReport) -> Result<SigningSettings<'key>> {
     let sign = &report.signing.macos.sign;
     let mut settings = SigningSettings::default();
     settings.set_binary_identifier(SettingsScope::Main, &report.metadata.bundle_identifier);
@@ -469,6 +526,37 @@ fn macos_signing_settings(report: &PackageReport) -> Result<SigningSettings<'sta
     }
 
     Ok(settings)
+}
+
+fn macos_p12_password(sign: &MacosSignPlan) -> Result<String> {
+    if let Some(password) = sign.p12_password.as_deref() {
+        return Ok(password.to_string());
+    }
+
+    if let Some(env_name) = &sign.p12_password_env {
+        return std::env::var(env_name)
+            .with_context(|| format!("Could not read macOS signing p12 password env {env_name}"));
+    }
+
+    if let Some(path) = &sign.p12_password_file {
+        let password_path = Path::new(path.as_str());
+        return fs::read_to_string(password_path)
+            .with_context(|| {
+                format!(
+                    "Could not read macOS signing p12 password file {}",
+                    password_path.display()
+                )
+            })
+            .and_then(|contents| {
+                contents
+                    .lines()
+                    .next()
+                    .map(str::to_string)
+                    .context("macOS signing p12 password file is empty")
+            });
+    }
+
+    Ok(String::new())
 }
 
 fn print_report(report: &PackageReport, json: bool) -> Result<()> {
@@ -506,6 +594,12 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
         );
         if let Some(identity) = &report.signing.macos.sign.identity {
             println!("  identity: {identity}");
+        }
+        if let Some(path) = &report.signing.macos.sign.p12_file {
+            println!("  p12 file: {path}");
+        }
+        if let Some(source) = &report.signing.macos.sign.p12_password_source {
+            println!("  p12 password: {source}");
         }
         if let Some(method) = &report.signing.macos.sign.method {
             println!("  signing method: {method}");
@@ -646,6 +740,26 @@ fn parse_macos_sign_config(value: Option<&JsonValue>) -> MacosSignConfig {
                 identity: object
                     .get("identity")
                     .or_else(|| object.get("identityName"))
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
+                p12_file: object
+                    .get("p12File")
+                    .or_else(|| object.get("pfxFile"))
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
+                p12_password: object
+                    .get("p12Password")
+                    .or_else(|| object.get("pfxPassword"))
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
+                p12_password_env: object
+                    .get("p12PasswordEnv")
+                    .or_else(|| object.get("pfxPasswordEnv"))
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
+                p12_password_file: object
+                    .get("p12PasswordFile")
+                    .or_else(|| object.get("pfxPasswordFile"))
                     .and_then(JsonValue::as_str)
                     .map(ToOwned::to_owned),
                 entitlements,
@@ -844,11 +958,60 @@ fn macos_sign_plan(
         }
     }
 
+    let p12_file = config
+        .p12_file
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| utf8_path(resolve_project_path(root, path)))
+        .transpose()?;
+    if let Some(path) = &p12_file {
+        if !Path::new(path.as_str()).exists() {
+            warnings.push(format!(
+                "Configured macOS signing p12 file does not exist: {}.",
+                path
+            ));
+        }
+    }
+    let p12_password_file = config
+        .p12_password_file
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| utf8_path(resolve_project_path(root, path)))
+        .transpose()?;
+    if let Some(path) = &p12_password_file {
+        if !Path::new(path.as_str()).exists() {
+            warnings.push(format!(
+                "Configured macOS signing p12 password file does not exist: {}.",
+                path
+            ));
+        }
+    }
+    let p12_password_source = if p12_file.is_some() {
+        if config.p12_password.is_some() {
+            Some("config".to_string())
+        } else if let Some(env_name) = config
+            .p12_password_env
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        {
+            Some(format!("env:{env_name}"))
+        } else if let Some(path) = &p12_password_file {
+            Some(format!("file:{path}"))
+        } else {
+            Some("empty".to_string())
+        }
+    } else {
+        None
+    };
+
     let identity = config.identity.as_deref().map(str::trim);
     let ad_hoc_identity = matches!(identity, None | Some("-"));
-    let will_execute = config.enabled && platform == "darwin" && ad_hoc_identity;
+    let p12_identity = p12_file.is_some();
+    let will_execute = config.enabled && platform == "darwin" && (ad_hoc_identity || p12_identity);
     let method = if config.enabled && platform == "darwin" {
-        if ad_hoc_identity {
+        if p12_identity {
+            Some("certificate-p12".to_string())
+        } else if ad_hoc_identity {
             Some("ad-hoc".to_string())
         } else {
             Some("certificate-identity".to_string())
@@ -863,17 +1026,22 @@ fn macos_sign_plan(
         ));
     } else if config.enabled && !will_execute {
         warnings.push(
-            "macOS signing identity is configured, but Rust-native certificate/keychain signing is not implemented yet; package output will be unsigned. Use identity '-' or omit identity for experimental ad-hoc signing.".to_string(),
+            "macOS signing identity is configured, but Rust-native keychain identity signing is not implemented yet; package output will be unsigned. Use p12File for certificate signing, or identity '-' / omit identity for experimental ad-hoc signing.".to_string(),
         );
     } else if will_execute {
+        if p12_identity && identity.is_some() {
+            warnings.push(
+                "packagerConfig.osxSign.p12File supplies the signing certificate; identity is reported but not used for keychain lookup.".to_string(),
+            );
+        }
         if config.entitlements.len() > 1 {
             warnings.push(
-                "Rust-native ad-hoc signing applies the first macOS entitlements file only; inherited/login-helper entitlement scoping is not implemented yet.".to_string(),
+                "Rust-native macOS signing applies the first macOS entitlements file only; inherited/login-helper entitlement scoping is not implemented yet.".to_string(),
             );
         }
         if config.entitlements_inherit.is_some() {
             warnings.push(
-                "packagerConfig.osxSign.entitlementsInherit is recognized but not applied to nested bundles by Rust-native ad-hoc signing yet.".to_string(),
+                "packagerConfig.osxSign.entitlementsInherit is recognized but not applied to nested bundles by Rust-native signing yet.".to_string(),
             );
         }
         if config.gatekeeper_assess.is_some() {
@@ -889,6 +1057,11 @@ fn macos_sign_plan(
         will_execute,
         method,
         identity: config.identity.clone(),
+        p12_file,
+        p12_password_source,
+        p12_password_env: config.p12_password_env.clone(),
+        p12_password_file,
+        p12_password: RedactedSecret::new(config.p12_password.clone()),
         entitlements,
         entitlements_inherit,
         hardened_runtime: config.hardened_runtime,
@@ -926,6 +1099,7 @@ fn macos_notarize_plan(
     if config.enabled
         && platform == "darwin"
         && package_config.packager.osx_sign.enabled
+        && package_config.packager.osx_sign.p12_file.is_none()
         && matches!(
             package_config
                 .packager
@@ -2008,7 +2182,7 @@ mod tests {
         assert!(report
             .warnings
             .iter()
-            .any(|warning| warning.contains("Rust-native certificate/keychain signing")));
+            .any(|warning| warning.contains("Rust-native keychain identity signing")));
         assert!(report
             .warnings
             .iter()
@@ -2063,9 +2237,70 @@ mod tests {
         assert_eq!(report.signing.macos.sign.identity.as_deref(), Some("-"));
         assert_eq!(report.signing.macos.sign.hardened_runtime, Some(true));
         assert!(!report.warnings.iter().any(|warning| {
-            warning.contains("Rust-native certificate/keychain signing")
+            warning.contains("Rust-native keychain identity signing")
                 || warning.contains("Rust-native signing is not implemented")
         }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plans_macos_p12_signing_without_serializing_password() {
+        let root = unique_temp_dir("macos-p12-signing-plan");
+        write_package_json(&root);
+        fs::write(root.join("developer-id.p12"), "not a real p12")
+            .expect("p12 placeholder should be written");
+        fs::write(
+            root.join("forge.config.js"),
+            r#"
+            module.exports = {
+              packagerConfig: {
+                osxSign: {
+                  identity: 'Developer ID Application: Example, Inc. (TEAMID1234)',
+                  p12File: 'developer-id.p12',
+                  p12Password: 'p12-secret',
+                  hardenedRuntime: true,
+                },
+              },
+            };
+            "#,
+        )
+        .expect("forge config should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("darwin".to_string()),
+            arch: Some("arm64".to_string()),
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.signing.macos.sign.configured);
+        assert!(report.signing.macos.sign.enabled);
+        assert!(report.signing.macos.sign.will_execute);
+        assert_eq!(
+            report.signing.macos.sign.method.as_deref(),
+            Some("certificate-p12")
+        );
+        assert_eq!(
+            report.signing.macos.sign.p12_password_source.as_deref(),
+            Some("config")
+        );
+        assert!(report.signing.macos.sign.p12_file.is_some());
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| { warning.contains("p12File supplies the signing certificate") }));
+
+        let json = serde_json::to_string(&report).expect("report should serialize");
+        assert!(!json.contains("p12-secret"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2253,6 +2488,69 @@ mod tests {
     }
 
     #[test]
+    fn packages_macos_bundle_with_p12_certificate_signature() {
+        if current_platform() != "darwin" {
+            return;
+        }
+
+        let Some(p12_fixture) = apple_codesign_test_fixture("apple-codesign-testuser.p12") else {
+            return;
+        };
+
+        let root = unique_temp_dir("macos-p12-signing-execute");
+        fs::copy(&p12_fixture, root.join("developer-id.p12"))
+            .expect("p12 fixture should be copied");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"starter-app","version":"0.1.0","main":"src/main.js","devDependencies":{"electron":"30.0.0"},"electronCli":{"packagerConfig":{"appBundleId":"com.example.p12-signed","osxSign":{"p12File":"developer-id.p12","p12Password":"password123","hardenedRuntime":true}}}}"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_macho_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.signing.macos.sign.will_execute);
+        assert_eq!(
+            report.signing.macos.sign.method.as_deref(),
+            Some("certificate-p12")
+        );
+        assert!(report.warnings.is_empty());
+
+        execute_package(&report, false).expect("package should succeed");
+
+        let executable = Path::new(report.bundle_dir.as_str())
+            .join("Contents/MacOS")
+            .join(&report.executable_name);
+        let executable_data = fs::read(executable).expect("signed executable should read");
+        let macho = apple_codesign::MachFile::parse(&executable_data)
+            .expect("signed executable should parse as Mach-O");
+        assert!(macho.iter_macho().all(|binary| {
+            let signature = binary
+                .code_signature()
+                .expect("code signature should parse")
+                .expect("code signature should exist");
+            signature
+                .signature_data()
+                .expect("CMS signature should parse")
+                .is_some_and(|data| !data.is_empty())
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn missing_required_runtime_dependency_fails() {
         let root = unique_temp_dir("runtime-deps");
         fs::write(
@@ -2413,6 +2711,31 @@ mod tests {
             app.join("Electron"),
         )
         .expect("Mach-O test executable should be copied");
+    }
+
+    fn apple_codesign_test_fixture(file_name: &str) -> Option<PathBuf> {
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))?;
+        let registry_src = cargo_home.join("registry/src");
+        for index_dir in fs::read_dir(registry_src).ok()? {
+            let index_dir = index_dir.ok()?;
+            for crate_dir in fs::read_dir(index_dir.path()).ok()? {
+                let crate_dir = crate_dir.ok()?;
+                let file_name_matches = crate_dir
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("apple-codesign-"));
+                if file_name_matches {
+                    let candidate = crate_dir.path().join("src").join(file_name);
+                    if candidate.exists() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

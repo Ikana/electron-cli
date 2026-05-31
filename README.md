@@ -41,9 +41,9 @@ The Rust-native flow currently owns:
 
 The GitHub publisher creates or reuses a release, uploads selected make artifacts, and can replace an existing asset with `--force`. It reads `GITHUB_TOKEN` or `GH_TOKEN` and can infer `OWNER/REPO` from package metadata, Forge GitHub publisher config, or `package.json` `repository`. You can also pass `--github-repo`.
 
-The package command recognizes macOS `packagerConfig.osxSign` and `packagerConfig.osxNotarize` options and reports the signing/notarization plan without serializing credential values. When `osxSign` is enabled on macOS and no certificate identity is configured, or the identity is `"-"`, `package` writes an experimental Rust-native ad-hoc signature for the generated `.app` bundle. Developer ID certificate/keychain signing and notarization execution are not implemented yet.
+The package command recognizes macOS `packagerConfig.osxSign` and `packagerConfig.osxNotarize` options and reports the signing/notarization plan without serializing credential values. When `osxSign` is enabled on macOS and no certificate identity is configured, or the identity is `"-"`, `package` writes an experimental Rust-native ad-hoc signature for the generated `.app` bundle. When `osxSign.p12File` points at a `.p12`/PFX certificate export, `package` can sign the bundle with that certificate. macOS keychain identity lookup and notarization execution are not implemented yet.
 
-The DMG maker is currently a pure-Rust FAT32 image with the app bundle and an Applications entry. The MSI maker writes a compressed embedded CAB, Windows Installer database tables, and a Start Menu shortcut when the packaged executable is present. HFS+/APFS DMG layout customization, installer UI customization, Windows/Linux icon embedding, Developer ID signing execution, and notarization execution are still TODO.
+The DMG maker is currently a pure-Rust FAT32 image with the app bundle and an Applications entry. The MSI maker writes a compressed embedded CAB, Windows Installer database tables, and a Start Menu shortcut when the packaged executable is present. HFS+/APFS DMG layout customization, installer UI customization, Windows/Linux icon embedding, macOS keychain signing, timestamping, and notarization execution are still TODO.
 
 Package metadata can be configured in `package.json`:
 
@@ -57,7 +57,8 @@ Package metadata can be configured in `package.json`:
       "icon": "assets/icon",
       "extraResource": "assets/config.json",
       "osxSign": {
-        "identity": "-",
+        "p12File": "certs/developer-id.p12",
+        "p12PasswordEnv": "ELECTRON_CLI_P12_PASSWORD",
         "entitlements": "assets/entitlements.plist",
         "hardenedRuntime": true
       },
@@ -97,7 +98,7 @@ Package metadata can be configured in `package.json`:
 }
 ```
 
-Set `identity` to a Developer ID certificate name when you want the plan to reflect Forge-style release signing, but this project will report it as not executable until Rust-native certificate/keychain signing exists. Use `identity: "-"` or omit `identity` for the current ad-hoc signing path.
+Use `p12PasswordEnv`, `p12PasswordFile`, or `p12Password` for the `.p12` password; password values are not serialized in package reports. Set `identity` to a Developer ID certificate name when you want the plan to reflect Forge-style keychain release signing, but this project will report it as not executable until Rust-native keychain lookup exists. Use `identity: "-"` or omit `identity` for the current ad-hoc signing path.
 
 The package command also reads JSON-shaped `config.forge.packagerConfig` and `electronPackagerConfig` entries for the same fields. The make command maps JSON-shaped Forge maker names to the Rust-native targets it supports: zip, dmg, deb, rpm, and wix/msi. The publish command maps JSON-shaped publisher names to local and GitHub.
 
