@@ -2001,14 +2001,6 @@ fn resolve_icon_resource(
         return Ok(None);
     }
 
-    if platform == "linux" {
-        warnings.push(
-            "Linux executable icons are not embedded; set the BrowserWindow icon in app code."
-                .to_string(),
-        );
-        return Ok(None);
-    }
-
     let extension = path_extension(&source).unwrap_or("icns");
     let destination = app_resources_dir.join(format!("{artifact_name}.{extension}"));
 
@@ -3948,6 +3940,10 @@ impl PackageReport {
 
     pub(crate) fn bundle_dir(&self) -> &Utf8PathBuf {
         &self.bundle_dir
+    }
+
+    pub(crate) fn icon_source(&self) -> Option<&Utf8PathBuf> {
+        self.metadata.icon.as_ref().map(|icon| &icon.from)
     }
 
     pub(crate) fn warnings(&self) -> &[String] {

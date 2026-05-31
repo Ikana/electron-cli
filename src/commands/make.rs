@@ -33,6 +33,7 @@ pub(crate) struct MakeReport {
     target: String,
     #[serde(skip)]
     target_kind: MakeTarget,
+    linux_icon: Option<MakeIconResource>,
     skip_package: bool,
     dry_run: bool,
     make_dir: Utf8PathBuf,
@@ -50,8 +51,19 @@ enum MakeStatus {
 }
 
 struct ResolvedMakeTargets {
-    targets: Vec<MakeTarget>,
+    targets: Vec<ResolvedMakeTarget>,
     warnings: Vec<String>,
+}
+
+struct ResolvedMakeTarget {
+    target: MakeTarget,
+    linux_icon: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MakeIconResource {
+    from: Utf8PathBuf,
+    to: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,33 +127,34 @@ pub(crate) fn build_reports(args: &MakeArgs) -> Result<Vec<MakeReport>> {
 
 fn build_report_for_target(
     package: PackageReport,
-    target: MakeTarget,
+    target: ResolvedMakeTarget,
     args: &MakeArgs,
     config_warnings: &[String],
 ) -> Result<MakeReport> {
+    let target_kind = target.target;
     let make_dir = Path::new(package.output_dir().as_str())
         .join("make")
-        .join(target.as_str())
+        .join(target_kind.as_str())
         .join(package.platform())
         .join(package.arch());
-    let artifact = make_artifact_path(&make_dir, &package, target);
+    let artifact = make_artifact_path(&make_dir, &package, target_kind);
 
     let mut warnings = package.warnings().to_vec();
     warnings.extend(config_warnings.iter().cloned());
-    if matches!(target, MakeTarget::Deb | MakeTarget::Rpm) && package.platform() != "linux" {
+    if matches!(target_kind, MakeTarget::Deb | MakeTarget::Rpm) && package.platform() != "linux" {
         warnings.push(format!(
             "{} maker only supports linux packages; target platform is {}.",
-            target.as_str(),
+            target_kind.as_str(),
             package.platform()
         ));
     }
-    if target == MakeTarget::Dmg && package.platform() != "darwin" {
+    if target_kind == MakeTarget::Dmg && package.platform() != "darwin" {
         warnings.push(format!(
             "dmg maker only supports macOS packages; target platform is {}.",
             package.platform()
         ));
     }
-    if target == MakeTarget::Msi && package.platform() != "win32" {
+    if target_kind == MakeTarget::Msi && package.platform() != "win32" {
         warnings.push(format!(
             "msi maker only supports Windows packages; target platform is {}.",
             package.platform()
@@ -160,11 +173,18 @@ fn build_report_for_target(
             artifact.display()
         ));
     }
+    let linux_icon = linux_icon_plan(
+        &package,
+        target_kind,
+        target.linux_icon.as_deref(),
+        &mut warnings,
+    )?;
 
     Ok(MakeReport {
         package,
-        target: target.as_str().to_string(),
-        target_kind: target,
+        target: target_kind.as_str().to_string(),
+        target_kind,
+        linux_icon,
         skip_package: args.skip_package,
         dry_run: args.dry_run,
         make_dir: utf8_path(make_dir)?,
@@ -175,10 +195,75 @@ fn build_report_for_target(
     })
 }
 
+fn linux_icon_plan(
+    package: &PackageReport,
+    target: MakeTarget,
+    configured_icon: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Result<Option<MakeIconResource>> {
+    if !matches!(target, MakeTarget::Deb | MakeTarget::Rpm) || package.platform() != "linux" {
+        return Ok(None);
+    }
+
+    let source = if let Some(icon) = configured_icon.filter(|icon| !icon.trim().is_empty()) {
+        let source = linux_icon_candidate(Path::new(package.project().root.as_str()), icon);
+        if !source.exists() {
+            warnings.push(format!(
+                "Configured Linux maker icon was not found and will not be installed: {}.",
+                source.display()
+            ));
+            return Ok(None);
+        }
+        source
+    } else if let Some(source) = package.icon_source() {
+        Path::new(source.as_str()).to_path_buf()
+    } else {
+        return Ok(None);
+    };
+
+    if !source.exists() {
+        warnings.push(format!(
+            "Configured Linux package icon was not found and will not be installed: {}.",
+            source.display()
+        ));
+        return Ok(None);
+    }
+
+    let package_name = match target {
+        MakeTarget::Deb => debian_package_name(&package.artifact_stem()),
+        MakeTarget::Rpm => rpm_package_name(&package.artifact_stem()),
+        _ => unreachable!("linux icon plan only runs for deb/rpm"),
+    };
+
+    Ok(Some(MakeIconResource {
+        from: utf8_path(source)?,
+        to: format!("/usr/share/pixmaps/{package_name}.png"),
+    }))
+}
+
+fn linux_icon_candidate(root: &Path, configured_icon: &str) -> PathBuf {
+    let path = resolve_project_path(root, configured_icon);
+    if path.extension().is_some() {
+        path
+    } else {
+        path.with_extension("png")
+    }
+}
+
+fn resolve_project_path(root: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
 struct ConfiguredMaker {
     label: String,
     target: Option<MakeTarget>,
     platforms: Vec<String>,
+    linux_icon: Option<String>,
 }
 
 fn resolve_make_targets(
@@ -187,7 +272,10 @@ fn resolve_make_targets(
 ) -> Result<ResolvedMakeTargets> {
     if let Some(target) = args.target {
         return Ok(ResolvedMakeTargets {
-            targets: vec![target],
+            targets: vec![ResolvedMakeTarget {
+                target,
+                linux_icon: None,
+            }],
             warnings: Vec::new(),
         });
     }
@@ -195,7 +283,7 @@ fn resolve_make_targets(
     let platform = args.platform.clone().unwrap_or_else(current_platform_label);
     let makers = configured_makers(snapshot)?;
     let mut warnings = Vec::new();
-    let mut targets = Vec::new();
+    let mut targets: Vec<ResolvedMakeTarget> = Vec::new();
 
     for maker in &makers {
         let Some(target) = maker.target else {
@@ -208,19 +296,28 @@ fn resolve_make_targets(
         if !maker_applies_to_platform(maker, &platform) {
             continue;
         }
-        if !targets.contains(&target) {
-            targets.push(target);
+        if !targets.iter().any(|resolved| resolved.target == target) {
+            targets.push(ResolvedMakeTarget {
+                target,
+                linux_icon: maker.linux_icon.clone(),
+            });
         }
     }
 
     if targets.is_empty() {
         if makers.is_empty() {
-            targets.push(MakeTarget::Zip);
+            targets.push(ResolvedMakeTarget {
+                target: MakeTarget::Zip,
+                linux_icon: None,
+            });
         } else {
             warnings.push(format!(
                 "No supported configured makers apply to {platform}; defaulting to zip. Pass --target to override."
             ));
-            targets.push(MakeTarget::Zip);
+            targets.push(ResolvedMakeTarget {
+                target: MakeTarget::Zip,
+                linux_icon: None,
+            });
         }
     }
 
@@ -259,6 +356,7 @@ fn parse_maker(value: &JsonValue) -> Option<ConfiguredMaker> {
             label: label.clone(),
             target: maker_target(label),
             platforms: Vec::new(),
+            linux_icon: None,
         }),
         JsonValue::Object(object) => {
             let label = object
@@ -270,11 +368,33 @@ fn parse_maker(value: &JsonValue) -> Option<ConfiguredMaker> {
             Some(ConfiguredMaker {
                 target: maker_target(&label),
                 platforms: string_values(object.get("platforms")),
+                linux_icon: maker_linux_icon(object),
                 label,
             })
         }
         _ => None,
     }
+}
+
+fn maker_linux_icon(object: &serde_json::Map<String, JsonValue>) -> Option<String> {
+    object
+        .get("config")
+        .and_then(|config| {
+            config
+                .get("options")
+                .and_then(|options| options.get("icon"))
+                .or_else(|| config.get("icon"))
+        })
+        .or_else(|| {
+            object
+                .get("options")
+                .and_then(|options| options.get("icon"))
+        })
+        .or_else(|| object.get("icon"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|icon| !icon.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn maker_target(label: &str) -> Option<MakeTarget> {
@@ -393,10 +513,14 @@ fn execute_make_artifact(report: &mut MakeReport, args: &MakeArgs) -> Result<()>
         MakeTarget::Zip => {
             write_zip_archive(Path::new(report.package.bundle_dir().as_str()), artifact)?
         }
-        MakeTarget::Deb => write_deb_archive(&report.package, artifact)?,
+        MakeTarget::Deb => {
+            write_deb_archive(&report.package, report.linux_icon.as_ref(), artifact)?
+        }
         MakeTarget::Dmg => write_dmg_archive(&report.package, artifact)?,
         MakeTarget::Msi => write_msi_archive(&report.package, artifact)?,
-        MakeTarget::Rpm => write_rpm_archive(&report.package, artifact)?,
+        MakeTarget::Rpm => {
+            write_rpm_archive(&report.package, report.linux_icon.as_ref(), artifact)?
+        }
     }
 
     Ok(())
@@ -429,6 +553,9 @@ fn print_report(report: &MakeReport, json: bool) -> Result<()> {
     println!("  {}", report.artifact);
     if let Some(size) = report.artifact_size {
         println!("  size: {size} bytes");
+    }
+    if let Some(icon) = &report.linux_icon {
+        println!("  linux icon: {} -> {}", icon.from, icon.to);
     }
 
     if !report.warnings.is_empty() {
@@ -848,7 +975,11 @@ fn directory_options(metadata: &fs::Metadata) -> SimpleFileOptions {
         .unix_permissions(unix_mode(metadata, 0o755))
 }
 
-fn write_deb_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
+fn write_deb_archive(
+    package: &PackageReport,
+    linux_icon: Option<&MakeIconResource>,
+    artifact: &Path,
+) -> Result<()> {
     if package.platform() != "linux" {
         bail!(
             "Deb maker only supports linux packages. Requested {}.",
@@ -873,7 +1004,9 @@ fn write_deb_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
     let control = debian_control_file(package, &deb_package, &version, &arch, installed_size);
     let control_tar =
         gzip_tar(|builder| append_bytes_to_tar(builder, "./control", control.as_bytes(), 0o644))?;
-    let data_tar = gzip_tar(|builder| append_deb_data_tar(builder, package, source, &deb_package))?;
+    let data_tar = gzip_tar(|builder| {
+        append_deb_data_tar(builder, package, source, &deb_package, linux_icon)
+    })?;
 
     write_ar_archive(
         artifact,
@@ -897,7 +1030,11 @@ fn write_deb_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
     )
 }
 
-fn write_rpm_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
+fn write_rpm_archive(
+    package: &PackageReport,
+    linux_icon: Option<&MakeIconResource>,
+    artifact: &Path,
+) -> Result<()> {
     if package.platform() != "linux" {
         bail!(
             "RPM maker only supports linux packages. Requested {}.",
@@ -956,6 +1093,9 @@ fn write_rpm_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
     ] {
         builder.with_dir_entry(FileOptions::dir(directory).permissions(0o755))?;
     }
+    if linux_icon.is_some() {
+        builder.with_dir_entry(FileOptions::dir("/usr/share/pixmaps").permissions(0o755))?;
+    }
 
     builder.with_dir(source, format!("/opt/{rpm_package}"), |options| options)?;
     builder.with_symlink(FileOptions::symlink(
@@ -963,10 +1103,16 @@ fn write_rpm_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
         &executable,
     ))?;
     builder.with_file_contents(
-        rpm_desktop_file(package, &rpm_package, &executable),
+        rpm_desktop_file(package, &rpm_package, &executable, linux_icon.is_some()),
         FileOptions::new(format!("/usr/share/applications/{rpm_package}.desktop"))
             .permissions(0o644),
     )?;
+    if let Some(icon) = linux_icon {
+        builder.with_file(
+            icon.from.as_str(),
+            FileOptions::new(icon.to.clone()).permissions(0o644),
+        )?;
+    }
 
     let rpm = builder.build()?;
     rpm.write_file(artifact)
@@ -1620,6 +1766,7 @@ fn append_deb_data_tar(
     package: &PackageReport,
     source: &Path,
     deb_package: &str,
+    linux_icon: Option<&MakeIconResource>,
 ) -> Result<()> {
     for directory in [
         "./",
@@ -1630,6 +1777,9 @@ fn append_deb_data_tar(
         "./usr/share/applications",
     ] {
         append_directory_to_tar(builder, directory, 0o755)?;
+    }
+    if linux_icon.is_some() {
+        append_directory_to_tar(builder, "./usr/share/pixmaps", 0o755)?;
     }
 
     let app_root = format!("./opt/{deb_package}");
@@ -1646,26 +1796,54 @@ fn append_deb_data_tar(
     append_bytes_to_tar(
         builder,
         format!("./usr/share/applications/{deb_package}.desktop"),
-        debian_desktop_file(package, deb_package, &executable).as_bytes(),
+        debian_desktop_file(package, deb_package, &executable, linux_icon.is_some()).as_bytes(),
         0o644,
     )?;
+    if let Some(icon) = linux_icon {
+        append_path_to_tar(
+            builder,
+            Path::new(icon.from.as_str()),
+            Path::new(&format!(".{}", icon.to)),
+        )?;
+    }
 
     Ok(())
 }
 
-fn debian_desktop_file(package: &PackageReport, deb_package: &str, executable: &str) -> String {
-    desktop_file(package, deb_package, executable)
+fn debian_desktop_file(
+    package: &PackageReport,
+    deb_package: &str,
+    executable: &str,
+    has_icon: bool,
+) -> String {
+    desktop_file(package, deb_package, executable, has_icon)
 }
 
-fn rpm_desktop_file(package: &PackageReport, rpm_package: &str, executable: &str) -> String {
-    desktop_file(package, rpm_package, executable)
+fn rpm_desktop_file(
+    package: &PackageReport,
+    rpm_package: &str,
+    executable: &str,
+    has_icon: bool,
+) -> String {
+    desktop_file(package, rpm_package, executable, has_icon)
 }
 
-fn desktop_file(package: &PackageReport, package_name: &str, executable: &str) -> String {
+fn desktop_file(
+    package: &PackageReport,
+    package_name: &str,
+    executable: &str,
+    has_icon: bool,
+) -> String {
+    let icon_line = if has_icon {
+        format!("Icon={package_name}\n")
+    } else {
+        String::new()
+    };
     format!(
         "[Desktop Entry]\n\
          Name={name}\n\
          Exec={executable} %U\n\
+         {icon_line}\
          Terminal=false\n\
          Type=Application\n\
          StartupWMClass={wm_class}\n\
@@ -2566,9 +2744,14 @@ mod tests {
     #[test]
     fn writes_deb_archive_with_control_and_data_members() {
         let root = unique_temp_dir("deb-archive");
-        write_package_json(&root);
+        write_package_json_with_makers(
+            &root,
+            r#"[{"name":"@electron-forge/maker-deb","config":{"options":{"icon":"assets/icon.png"}}}]"#,
+        );
         write_app_file(&root);
         write_fake_electron_dist(&root);
+        fs::create_dir_all(root.join("assets")).expect("assets should be created");
+        fs::write(root.join("assets/icon.png"), b"png").expect("icon should be written");
 
         let args = MakeArgs {
             cwd: root.clone(),
@@ -2576,13 +2759,15 @@ mod tests {
             name: None,
             platform: Some("linux".to_string()),
             arch: Some("x64".to_string()),
-            target: Some(crate::cli::MakeTarget::Deb),
+            target: None,
             skip_package: false,
             force: false,
             dry_run: true,
             json: true,
         };
         let report = build_report(&args).expect("report should build");
+        assert_eq!(report.target, "deb");
+        assert!(report.linux_icon.is_some());
         let bundle_dir = Path::new(report.package.bundle_dir().as_str());
         fs::create_dir_all(bundle_dir.join("resources/app"))
             .expect("fake bundle resources should be created");
@@ -2590,8 +2775,12 @@ mod tests {
         fs::write(bundle_dir.join("resources/app/package.json"), "{}")
             .expect("fake app package should be written");
 
-        write_deb_archive(&report.package, Path::new(report.artifact.as_str()))
-            .expect("deb should be written");
+        write_deb_archive(
+            &report.package,
+            report.linux_icon.as_ref(),
+            Path::new(report.artifact.as_str()),
+        )
+        .expect("deb should be written");
 
         let members = read_ar_members(Path::new(report.artifact.as_str()));
         assert_eq!(
@@ -2617,7 +2806,10 @@ mod tests {
             data,
             "usr/share/applications/starter-app.desktop"
         ));
+        assert!(tar_contains(data, "usr/share/pixmaps/starter-app.png"));
         assert!(tar_contains(data, "usr/bin/starter-app"));
+        let desktop = read_tar_file(data, "usr/share/applications/starter-app.desktop");
+        assert!(desktop.contains("Icon=starter-app"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2693,9 +2885,11 @@ mod tests {
     #[test]
     fn writes_rpm_archive_with_metadata_and_payload_entries() {
         let root = unique_temp_dir("rpm-archive");
-        write_package_json(&root);
+        write_package_json_with_packager_config(&root, r#"{"icon":"assets/icon.png"}"#);
         write_app_file(&root);
         write_fake_electron_dist(&root);
+        fs::create_dir_all(root.join("assets")).expect("assets should be created");
+        fs::write(root.join("assets/icon.png"), b"png").expect("icon should be written");
 
         let args = MakeArgs {
             cwd: root.clone(),
@@ -2710,6 +2904,7 @@ mod tests {
             json: true,
         };
         let report = build_report(&args).expect("report should build");
+        assert!(report.linux_icon.is_some());
         let bundle_dir = Path::new(report.package.bundle_dir().as_str());
         fs::create_dir_all(bundle_dir.join("resources/app"))
             .expect("fake bundle resources should be created");
@@ -2717,8 +2912,12 @@ mod tests {
         fs::write(bundle_dir.join("resources/app/package.json"), "{}")
             .expect("fake app package should be written");
 
-        write_rpm_archive(&report.package, Path::new(report.artifact.as_str()))
-            .expect("rpm should be written");
+        write_rpm_archive(
+            &report.package,
+            report.linux_icon.as_ref(),
+            Path::new(report.artifact.as_str()),
+        )
+        .expect("rpm should be written");
 
         let rpm = rpm::Package::open(report.artifact.as_str()).expect("rpm should parse");
         assert_eq!(
@@ -2744,6 +2943,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(paths.contains(&"/opt/starter-app/resources/app/package.json".to_string()));
         assert!(paths.contains(&"/usr/share/applications/starter-app.desktop".to_string()));
+        assert!(paths.contains(&"/usr/share/pixmaps/starter-app.png".to_string()));
         assert!(paths.contains(&"/usr/bin/starter-app".to_string()));
 
         let _ = fs::remove_dir_all(root);
@@ -2938,6 +3138,23 @@ mod tests {
             ),
         )
         .expect("package.json with makers should be written");
+    }
+
+    fn write_package_json_with_packager_config(root: &Path, packager_config: &str) {
+        fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{
+                    "name":"starter-app",
+                    "version":"0.1.0",
+                    "license":"MIT",
+                    "main":"src/main.js",
+                    "devDependencies":{{"electron":"30.0.0"}},
+                    "config":{{"forge":{{"packagerConfig":{packager_config}}}}}
+                }}"#
+            ),
+        )
+        .expect("package.json with packager config should be written");
     }
 
     fn write_app_file(root: &Path) {
