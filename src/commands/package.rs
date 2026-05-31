@@ -15,6 +15,7 @@ use apple_codesign::{
     SigningSettings,
 };
 use camino::Utf8PathBuf;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use plist::{Dictionary as PlistDictionary, Value as PlistValue};
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
@@ -76,6 +77,9 @@ struct AsarPlan {
     configured: bool,
     enabled: bool,
     archive: Option<Utf8PathBuf>,
+    unpacked_dir: Option<Utf8PathBuf>,
+    unpack: Vec<String>,
+    unpack_dir: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -189,6 +193,8 @@ struct AsarConfig {
     configured: bool,
     enabled: bool,
     invalid_type: bool,
+    unpack: Vec<String>,
+    unpack_dir: Vec<String>,
     unsupported_options: Vec<String>,
 }
 
@@ -843,6 +849,17 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
         if let Some(archive) = &report.asar.archive {
             println!("  archive: {archive}");
         }
+        if let Some(unpacked_dir) = &report.asar.unpacked_dir {
+            if !report.asar.unpack.is_empty() || !report.asar.unpack_dir.is_empty() {
+                println!("  unpacked dir: {unpacked_dir}");
+            }
+        }
+        if !report.asar.unpack.is_empty() {
+            println!("  unpack: {}", report.asar.unpack.join(", "));
+        }
+        if !report.asar.unpack_dir.is_empty() {
+            println!("  unpack dir: {}", report.asar.unpack_dir.join(", "));
+        }
     }
 
     println!();
@@ -947,12 +964,21 @@ fn parse_asar_config(value: Option<&JsonValue>) -> AsarConfig {
             enabled: true,
             ..AsarConfig::default()
         },
-        Some(JsonValue::Object(object)) => AsarConfig {
-            configured: true,
-            enabled: true,
-            invalid_type: false,
-            unsupported_options: object.keys().cloned().collect(),
-        },
+        Some(JsonValue::Object(object)) => {
+            let supported_options = ["unpack", "unpackDir"];
+            AsarConfig {
+                configured: true,
+                enabled: true,
+                invalid_type: false,
+                unpack: string_list(object.get("unpack")),
+                unpack_dir: string_list(object.get("unpackDir")),
+                unsupported_options: object
+                    .keys()
+                    .filter(|key| !supported_options.contains(&key.as_str()))
+                    .cloned()
+                    .collect(),
+            }
+        }
         Some(_) => AsarConfig {
             configured: true,
             invalid_type: true,
@@ -1279,9 +1305,12 @@ fn package_asar(
 
     if config.enabled && !config.unsupported_options.is_empty() {
         warnings.push(format!(
-            "packagerConfig.asar options are recognized but not implemented yet and will be ignored: {}.",
+            "packagerConfig.asar options are not implemented by electron-cli yet and will be ignored: {}.",
             config.unsupported_options.join(", ")
         ));
+    }
+    if config.enabled {
+        let _ = AsarUnpackRules::compile(&config.unpack, &config.unpack_dir, Some(&mut warnings));
     }
 
     Ok((
@@ -1292,6 +1321,12 @@ fn package_asar(
                 .enabled
                 .then(|| utf8_path(app_resources_dir.join("app.asar")))
                 .transpose()?,
+            unpacked_dir: config
+                .enabled
+                .then(|| utf8_path(app_resources_dir.join("app.asar.unpacked")))
+                .transpose()?,
+            unpack: config.unpack.clone(),
+            unpack_dir: config.unpack_dir.clone(),
         },
         warnings,
     ))
@@ -1949,24 +1984,40 @@ enum AsarHeaderNode {
     File(AsarFileHeader),
     Directory {
         files: BTreeMap<String, AsarHeaderNode>,
+        #[serde(skip_serializing_if = "is_false")]
+        unpacked: bool,
     },
     Link {
         link: String,
+        #[serde(skip_serializing_if = "is_false")]
+        unpacked: bool,
     },
 }
 
 #[derive(Serialize)]
 struct AsarFileHeader {
     size: u64,
-    offset: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    unpacked: bool,
     #[serde(skip_serializing_if = "is_false")]
     executable: bool,
 }
 
 enum AsarEntryKind {
-    Directory,
-    File { size: u64, executable: bool },
-    Link { target: String },
+    Directory {
+        unpacked: bool,
+    },
+    File {
+        size: u64,
+        executable: bool,
+        unpacked: bool,
+    },
+    Link {
+        target: String,
+        unpacked: bool,
+    },
 }
 
 struct AsarEntry {
@@ -1977,6 +2028,141 @@ struct AsarEntry {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+struct AsarUnpackRules {
+    unpack: Option<GlobSet>,
+    unpack_dir: Option<GlobSet>,
+    unpack_dir_prefixes: Vec<String>,
+}
+
+impl AsarUnpackRules {
+    fn compile(
+        unpack: &[String],
+        unpack_dir: &[String],
+        mut warnings: Option<&mut Vec<String>>,
+    ) -> Self {
+        Self {
+            unpack: compile_asar_globs(unpack, true, "packagerConfig.asar.unpack", &mut warnings),
+            unpack_dir: compile_asar_globs(
+                unpack_dir,
+                false,
+                "packagerConfig.asar.unpackDir",
+                &mut warnings,
+            ),
+            unpack_dir_prefixes: unpack_dir
+                .iter()
+                .map(|pattern| normalize_glob_path(pattern))
+                .collect(),
+        }
+    }
+
+    fn from_plan(plan: &AsarPlan) -> Self {
+        Self::compile(&plan.unpack, &plan.unpack_dir, None)
+    }
+
+    fn should_unpack_file(&self, source: &Path, relative: &Path, parent_unpacked: bool) -> bool {
+        if parent_unpacked {
+            return true;
+        }
+
+        let Some(unpack) = &self.unpack else {
+            return false;
+        };
+
+        let relative = path_to_forward_slashes(relative);
+        let absolute = path_to_forward_slashes(source);
+        let basename = relative
+            .rsplit('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(relative.as_str());
+
+        unpack.is_match(relative.as_str())
+            || unpack.is_match(absolute.as_str())
+            || unpack.is_match(basename)
+    }
+
+    fn should_unpack_dir(&self, relative: &Path, parent_unpacked: bool) -> bool {
+        if parent_unpacked {
+            return true;
+        }
+
+        let relative = path_to_forward_slashes(relative);
+        let relative = relative.trim_matches('/');
+        if relative.is_empty() {
+            return false;
+        }
+
+        if self
+            .unpack_dir_prefixes
+            .iter()
+            .any(|pattern| !pattern.is_empty() && relative.starts_with(pattern))
+        {
+            return true;
+        }
+
+        let Some(unpack_dir) = &self.unpack_dir else {
+            return false;
+        };
+
+        unpack_dir.is_match(relative) || unpack_dir.is_match(format!("{relative}/").as_str())
+    }
+}
+
+fn compile_asar_globs(
+    patterns: &[String],
+    match_base: bool,
+    label: &str,
+    warnings: &mut Option<&mut Vec<String>>,
+) -> Option<GlobSet> {
+    if patterns.is_empty() {
+        return None;
+    }
+
+    let mut builder = GlobSetBuilder::new();
+    let mut valid = false;
+
+    for pattern in patterns {
+        for candidate in asar_glob_candidates(pattern, match_base) {
+            match Glob::new(&candidate) {
+                Ok(glob) => {
+                    builder.add(glob);
+                    valid = true;
+                }
+                Err(error) => {
+                    if let Some(warnings) = warnings.as_deref_mut() {
+                        warnings.push(format!(
+                            "{label} pattern '{}' is not a valid glob: {error}.",
+                            pattern
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    valid.then(|| builder.build().expect("valid ASAR glob set should build"))
+}
+
+fn asar_glob_candidates(pattern: &str, match_base: bool) -> Vec<String> {
+    let pattern = normalize_glob_path(pattern);
+    if pattern.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = vec![pattern.clone()];
+    if match_base && !pattern.contains('/') {
+        candidates.push(format!("**/{pattern}"));
+    }
+    if let Some(stripped) = pattern.strip_prefix('/') {
+        candidates.push(stripped.to_string());
+    }
+    candidates
+}
+
+fn normalize_glob_path(pattern: &str) -> String {
+    pattern.replace('\\', "/").trim_matches('/').to_string()
 }
 
 fn execute_asar_packaging(report: &PackageReport) -> Result<()> {
@@ -1991,6 +2177,11 @@ fn execute_asar_packaging(report: &PackageReport) -> Result<()> {
         .as_ref()
         .context("ASAR packaging is enabled without an archive path")?;
     let archive = Path::new(archive.as_str());
+    let unpacked_dir = report
+        .asar
+        .unpacked_dir
+        .as_ref()
+        .map(|path| PathBuf::from(path.as_str()));
 
     if !app_dir.exists() {
         bail!(
@@ -1999,9 +2190,10 @@ fn execute_asar_packaging(report: &PackageReport) -> Result<()> {
         );
     }
 
-    let entries = collect_asar_entries(&app_dir, &app_dir)
+    let unpack_rules = AsarUnpackRules::from_plan(&report.asar);
+    let entries = collect_asar_entries(&app_dir, &app_dir, &unpack_rules)
         .with_context(|| format!("Could not collect ASAR entries from {}", app_dir.display()))?;
-    write_asar_archive(&entries, archive)
+    write_asar_archive(&entries, archive, unpacked_dir.as_deref())
         .with_context(|| format!("Could not write ASAR archive {}", archive.display()))?;
 
     fs::remove_dir_all(&app_dir).with_context(|| {
@@ -2012,15 +2204,21 @@ fn execute_asar_packaging(report: &PackageReport) -> Result<()> {
     })
 }
 
-fn collect_asar_entries(source: &Path, base: &Path) -> Result<Vec<AsarEntry>> {
+fn collect_asar_entries(
+    source: &Path,
+    base: &Path,
+    unpack_rules: &AsarUnpackRules,
+) -> Result<Vec<AsarEntry>> {
     let mut entries = Vec::new();
-    collect_asar_entries_into(source, base, &mut entries)?;
+    collect_asar_entries_into(source, base, unpack_rules, false, &mut entries)?;
     Ok(entries)
 }
 
 fn collect_asar_entries_into(
     source: &Path,
     base: &Path,
+    unpack_rules: &AsarUnpackRules,
+    parent_unpacked: bool,
     entries: &mut Vec<AsarEntry>,
 ) -> Result<()> {
     let mut children = fs::read_dir(source)
@@ -2035,27 +2233,35 @@ fn collect_asar_entries_into(
         if metadata.file_type().is_symlink() {
             let target = fs::read_link(&path)
                 .with_context(|| format!("Could not read symlink {}", path.display()))?;
+            let relative = asar_relative_path(&path, base)?;
+            let unpacked = unpack_rules.should_unpack_file(&path, &relative, parent_unpacked);
             entries.push(AsarEntry {
                 source: path.clone(),
-                relative: asar_relative_path(&path, base)?,
+                relative,
                 kind: AsarEntryKind::Link {
                     target: path_to_forward_slashes(&target),
+                    unpacked,
                 },
             });
         } else if metadata.is_dir() {
+            let relative = asar_relative_path(&path, base)?;
+            let unpacked = unpack_rules.should_unpack_dir(&relative, parent_unpacked);
             entries.push(AsarEntry {
                 source: path.clone(),
-                relative: asar_relative_path(&path, base)?,
-                kind: AsarEntryKind::Directory,
+                relative,
+                kind: AsarEntryKind::Directory { unpacked },
             });
-            collect_asar_entries_into(&path, base, entries)?;
+            collect_asar_entries_into(&path, base, unpack_rules, unpacked, entries)?;
         } else if metadata.is_file() {
+            let relative = asar_relative_path(&path, base)?;
+            let unpacked = unpack_rules.should_unpack_file(&path, &relative, parent_unpacked);
             entries.push(AsarEntry {
                 source: path.clone(),
-                relative: asar_relative_path(&path, base)?,
+                relative,
                 kind: AsarEntryKind::File {
                     size: metadata.len(),
                     executable: is_executable(&metadata),
+                    unpacked,
                 },
             });
         }
@@ -2064,41 +2270,55 @@ fn collect_asar_entries_into(
     Ok(())
 }
 
-fn write_asar_archive(entries: &[AsarEntry], archive: &Path) -> Result<()> {
+fn write_asar_archive(
+    entries: &[AsarEntry],
+    archive: &Path,
+    unpacked_dir: Option<&Path>,
+) -> Result<()> {
     let mut header = AsarHeaderNode::Directory {
         files: BTreeMap::new(),
+        unpacked: false,
     };
     let mut offset = 0_u64;
 
     for entry in entries {
         match &entry.kind {
-            AsarEntryKind::Directory => {
+            AsarEntryKind::Directory { unpacked } => {
                 insert_asar_header_entry(
                     &mut header,
                     &entry.relative,
                     AsarHeaderNode::Directory {
                         files: BTreeMap::new(),
+                        unpacked: *unpacked,
                     },
                 )?;
             }
-            AsarEntryKind::File { size, executable } => {
+            AsarEntryKind::File {
+                size,
+                executable,
+                unpacked,
+            } => {
                 insert_asar_header_entry(
                     &mut header,
                     &entry.relative,
                     AsarHeaderNode::File(AsarFileHeader {
                         size: *size,
-                        offset: offset.to_string(),
+                        offset: (!*unpacked).then(|| offset.to_string()),
+                        unpacked: *unpacked,
                         executable: *executable,
                     }),
                 )?;
-                offset = offset.saturating_add(*size);
+                if !unpacked {
+                    offset = offset.saturating_add(*size);
+                }
             }
-            AsarEntryKind::Link { target } => {
+            AsarEntryKind::Link { target, unpacked } => {
                 insert_asar_header_entry(
                     &mut header,
                     &entry.relative,
                     AsarHeaderNode::Link {
                         link: target.clone(),
+                        unpacked: *unpacked,
                     },
                 )?;
             }
@@ -2110,6 +2330,13 @@ fn write_asar_archive(entries: &[AsarEntry], archive: &Path) -> Result<()> {
     let aligned_json_size = json_size + (4 - (json_size % 4)) % 4;
     json.resize(aligned_json_size as usize, 0);
 
+    if let Some(unpacked_dir) = unpacked_dir {
+        if unpacked_dir.exists() {
+            fs::remove_dir_all(unpacked_dir)
+                .with_context(|| format!("Could not remove {}", unpacked_dir.display()))?;
+        }
+    }
+
     let file = File::create(archive)
         .with_context(|| format!("Could not create ASAR archive {}", archive.display()))?;
     let mut writer = BufWriter::new(file);
@@ -2120,15 +2347,110 @@ fn write_asar_archive(entries: &[AsarEntry], archive: &Path) -> Result<()> {
     writer.write_all(&json)?;
 
     for entry in entries {
-        if matches!(entry.kind, AsarEntryKind::File { .. }) {
-            let mut input = File::open(&entry.source)
-                .with_context(|| format!("Could not open {}", entry.source.display()))?;
-            io::copy(&mut input, &mut writer)
-                .with_context(|| format!("Could not write {} to ASAR", entry.source.display()))?;
+        match &entry.kind {
+            AsarEntryKind::File {
+                unpacked: false, ..
+            } => {
+                let mut input = File::open(&entry.source)
+                    .with_context(|| format!("Could not open {}", entry.source.display()))?;
+                io::copy(&mut input, &mut writer).with_context(|| {
+                    format!("Could not write {} to ASAR", entry.source.display())
+                })?;
+            }
+            AsarEntryKind::File { unpacked: true, .. } => {
+                let unpacked_dir = unpacked_dir.context("ASAR unpacked file has no output dir")?;
+                copy_unpacked_asar_file(&entry.source, unpacked_dir, &entry.relative)?;
+            }
+            AsarEntryKind::Directory { unpacked: true } => {
+                let unpacked_dir =
+                    unpacked_dir.context("ASAR unpacked directory has no output dir")?;
+                create_unpacked_asar_dir(unpacked_dir, &entry.relative)?;
+            }
+            AsarEntryKind::Link { unpacked: true, .. } => {
+                let unpacked_dir = unpacked_dir.context("ASAR unpacked link has no output dir")?;
+                create_unpacked_asar_symlink(&entry.source, unpacked_dir, &entry.relative)?;
+            }
+            AsarEntryKind::Directory { unpacked: false }
+            | AsarEntryKind::Link {
+                unpacked: false, ..
+            } => {}
         }
     }
 
     writer.flush().context("Could not flush ASAR archive")
+}
+
+fn copy_unpacked_asar_file(source: &Path, unpacked_dir: &Path, relative: &Path) -> Result<()> {
+    let destination = unpacked_dir.join(relative);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create {}", parent.display()))?;
+    }
+    fs::copy(source, &destination).with_context(|| {
+        format!(
+            "Could not copy unpacked ASAR file {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    let permissions = fs::metadata(source)
+        .with_context(|| format!("Could not stat {}", source.display()))?
+        .permissions();
+    fs::set_permissions(&destination, permissions)
+        .with_context(|| format!("Could not set permissions on {}", destination.display()))
+}
+
+fn create_unpacked_asar_dir(unpacked_dir: &Path, relative: &Path) -> Result<()> {
+    let destination = unpacked_dir.join(relative);
+    fs::create_dir_all(&destination)
+        .with_context(|| format!("Could not create {}", destination.display()))
+}
+
+#[cfg(unix)]
+fn create_unpacked_asar_symlink(source: &Path, unpacked_dir: &Path, relative: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let destination = unpacked_dir.join(relative);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create {}", parent.display()))?;
+    }
+    let target = fs::read_link(source)
+        .with_context(|| format!("Could not read symlink {}", source.display()))?;
+    symlink(&target, &destination).with_context(|| {
+        format!(
+            "Could not create unpacked ASAR symlink {} -> {}",
+            destination.display(),
+            target.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn create_unpacked_asar_symlink(source: &Path, unpacked_dir: &Path, relative: &Path) -> Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+
+    let destination = unpacked_dir.join(relative);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create {}", parent.display()))?;
+    }
+    let target = fs::read_link(source)
+        .with_context(|| format!("Could not read symlink {}", source.display()))?;
+    let metadata =
+        fs::metadata(source).with_context(|| format!("Could not stat {}", source.display()))?;
+    let result = if metadata.is_dir() {
+        symlink_dir(&target, &destination)
+    } else {
+        symlink_file(&target, &destination)
+    };
+    result.with_context(|| {
+        format!(
+            "Could not create unpacked ASAR symlink {} -> {}",
+            destination.display(),
+            target.display()
+        )
+    })
 }
 
 fn insert_asar_header_entry(
@@ -2145,7 +2467,7 @@ fn insert_asar_header_components(
     components: &[String],
     leaf: AsarHeaderNode,
 ) -> Result<()> {
-    let AsarHeaderNode::Directory { files } = header else {
+    let AsarHeaderNode::Directory { files, .. } = header else {
         bail!("ASAR header path conflicts with an existing file");
     };
     let Some((name, rest)) = components.split_first() else {
@@ -2159,6 +2481,7 @@ fn insert_asar_header_components(
             .entry(name.clone())
             .or_insert_with(|| AsarHeaderNode::Directory {
                 files: BTreeMap::new(),
+                unpacked: false,
             });
         insert_asar_header_components(child, rest, leaf)?;
     }
@@ -3086,11 +3409,81 @@ mod tests {
     }
 
     #[test]
-    fn warns_for_unsupported_asar_options_but_plans_archive() {
+    fn packages_asar_unpacked_files_and_directories() {
+        let root = unique_temp_dir("asar-unpacked");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"starter-app","version":"0.1.0","main":"src/main.js","dependencies":{"dep-a":"1.0.0"},"devDependencies":{"electron":"30.0.0"},"electronCli":{"packagerConfig":{"asar":{"unpack":"**/*.node","unpackDir":"assets/native"}}}}"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+        write_dependency_package(&root, "dep-a", r#"{"name":"dep-a","version":"1.0.0"}"#);
+        let native_dep_dir = root.join("node_modules/dep-a/build/Release");
+        fs::create_dir_all(&native_dep_dir).expect("native dependency dir should be created");
+        fs::write(native_dep_dir.join("addon.node"), b"native-addon")
+            .expect("native dependency should be written");
+        let native_asset_dir = root.join("assets/native");
+        fs::create_dir_all(&native_asset_dir).expect("native asset dir should be created");
+        fs::write(native_asset_dir.join("data.bin"), b"native-data")
+            .expect("native asset should be written");
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert_eq!(report.asar.unpack, vec!["**/*.node"]);
+        assert_eq!(report.asar.unpack_dir, vec!["assets/native"]);
+        assert!(report.warnings.is_empty());
+
+        execute_package(&report, false).expect("package should succeed");
+
+        let app_asar = Path::new(report.app_resources_dir.as_str()).join("app.asar");
+        let unpacked_dir = Path::new(report.asar.unpacked_dir.as_ref().unwrap().as_str());
+        let unpacked_node = unpacked_dir.join("node_modules/dep-a/build/Release/addon.node");
+        let unpacked_asset = unpacked_dir.join("assets/native/data.bin");
+        assert!(app_asar.exists());
+        assert!(unpacked_node.exists());
+        assert!(unpacked_asset.exists());
+        assert!(!unpacked_dir.join("package.json").exists());
+
+        let archive = fs::read(&app_asar).expect("ASAR archive should read");
+        let reader =
+            asar::AsarReader::new(&archive, app_asar.clone()).expect("ASAR archive should parse");
+        assert_eq!(
+            reader
+                .read(Path::new("node_modules/dep-a/build/Release/addon.node"))
+                .expect("unpacked native dependency should be readable")
+                .data(),
+            b"native-addon"
+        );
+        assert_eq!(
+            reader
+                .read(Path::new("assets/native/data.bin"))
+                .expect("unpacked native asset should be readable")
+                .data(),
+            b"native-data"
+        );
+        assert!(reader.read(Path::new("package.json")).is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn warns_for_unsupported_asar_options_but_keeps_supported_unpacks() {
         let root = unique_temp_dir("asar-options");
         fs::write(
             root.join("package.json"),
-            r#"{"name":"starter-app","version":"0.1.0","main":"src/main.js","devDependencies":{"electron":"30.0.0"},"electronCli":{"packagerConfig":{"asar":{"unpack":"**/*.node","ordering":"ordering.txt"}}}}"#,
+            r#"{"name":"starter-app","version":"0.1.0","main":"src/main.js","devDependencies":{"electron":"30.0.0"},"electronCli":{"packagerConfig":{"asar":{"unpack":"**/*.node","unpackDir":"assets/native","ordering":"ordering.txt","transform":"ignored"}}}}"#,
         )
         .expect("package.json should be written");
         write_app_file(&root);
@@ -3112,10 +3505,13 @@ mod tests {
         assert!(report.asar.configured);
         assert!(report.asar.enabled);
         assert!(report.asar.archive.is_some());
+        assert_eq!(report.asar.unpack, vec!["**/*.node"]);
+        assert_eq!(report.asar.unpack_dir, vec!["assets/native"]);
         assert!(report.warnings.iter().any(|warning| {
             warning.contains("packagerConfig.asar options")
-                && warning.contains("unpack")
                 && warning.contains("ordering")
+                && warning.contains("transform")
+                && !warning.contains("unpackDir")
         }));
 
         let _ = fs::remove_dir_all(root);
