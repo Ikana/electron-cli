@@ -3196,7 +3196,7 @@ mod tests {
             fs::write(app.join("Electron"), "").expect("fake macOS binary should be written");
         } else if cfg!(target_os = "windows") {
             fs::create_dir_all(&dist).expect("fake electron dist should be created");
-            fs::write(dist.join("electron.exe"), "").expect("fake exe should be written");
+            crate::commands::package::write_minimal_pe_executable(&dist.join("electron.exe"));
         } else {
             fs::create_dir_all(&dist).expect("fake electron dist should be created");
             fs::write(dist.join("electron"), "").expect("fake binary should be written");

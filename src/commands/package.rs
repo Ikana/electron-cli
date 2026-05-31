@@ -3404,6 +3404,94 @@ fn windows_version_part(version: &str, raw_part: &str) -> Result<u16> {
     })
 }
 
+#[cfg(test)]
+pub(crate) fn write_minimal_pe_executable(path: &Path) {
+    let mut bytes = vec![0u8; 0x80];
+    bytes[0] = b'M';
+    bytes[1] = b'Z';
+    write_test_u32_at(&mut bytes, 0x3c, 0x80);
+
+    bytes.extend(b"PE\0\0");
+    push_test_u16(&mut bytes, 0x8664);
+    push_test_u16(&mut bytes, 1);
+    push_test_u32(&mut bytes, 0);
+    push_test_u32(&mut bytes, 0);
+    push_test_u32(&mut bytes, 0);
+    push_test_u16(&mut bytes, 0xf0);
+    push_test_u16(&mut bytes, 0x0022);
+
+    push_test_u16(&mut bytes, 0x20b);
+    bytes.push(14);
+    bytes.push(0);
+    push_test_u32(&mut bytes, 0x200);
+    push_test_u32(&mut bytes, 0x200);
+    push_test_u32(&mut bytes, 0);
+    push_test_u32(&mut bytes, 0x1000);
+    push_test_u32(&mut bytes, 0x1000);
+
+    push_test_u64(&mut bytes, 0x140000000);
+    push_test_u32(&mut bytes, 0x1000);
+    push_test_u32(&mut bytes, 0x200);
+    push_test_u16(&mut bytes, 6);
+    push_test_u16(&mut bytes, 0);
+    push_test_u16(&mut bytes, 0);
+    push_test_u16(&mut bytes, 0);
+    push_test_u16(&mut bytes, 6);
+    push_test_u16(&mut bytes, 0);
+    push_test_u32(&mut bytes, 0);
+    push_test_u32(&mut bytes, 0x2000);
+    push_test_u32(&mut bytes, 0x400);
+    push_test_u32(&mut bytes, 0);
+    push_test_u16(&mut bytes, 3);
+    push_test_u16(&mut bytes, 0x8160);
+    push_test_u64(&mut bytes, 0x100000);
+    push_test_u64(&mut bytes, 0x1000);
+    push_test_u64(&mut bytes, 0x100000);
+    push_test_u64(&mut bytes, 0x1000);
+    push_test_u32(&mut bytes, 0);
+    push_test_u32(&mut bytes, 16);
+    for _ in 0..16 {
+        push_test_u32(&mut bytes, 0);
+        push_test_u32(&mut bytes, 0);
+    }
+
+    bytes.extend(b".text\0\0\0");
+    push_test_u32(&mut bytes, 1);
+    push_test_u32(&mut bytes, 0x1000);
+    push_test_u32(&mut bytes, 0x200);
+    push_test_u32(&mut bytes, 0x400);
+    push_test_u32(&mut bytes, 0);
+    push_test_u32(&mut bytes, 0);
+    push_test_u16(&mut bytes, 0);
+    push_test_u16(&mut bytes, 0);
+    push_test_u32(&mut bytes, 0x60000020);
+
+    bytes.resize(0x400, 0);
+    bytes.push(0xc3);
+    bytes.resize(0x600, 0);
+    fs::write(path, bytes).expect("minimal PE should be written");
+}
+
+#[cfg(test)]
+fn push_test_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend(value.to_le_bytes());
+}
+
+#[cfg(test)]
+fn push_test_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend(value.to_le_bytes());
+}
+
+#[cfg(test)]
+fn push_test_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend(value.to_le_bytes());
+}
+
+#[cfg(test)]
+fn write_test_u32_at(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
 fn apply_macos_metadata(report: &PackageReport) -> Result<()> {
     let bundle_dir = Path::new(report.bundle_dir.as_str());
     let info_plist_path = bundle_dir.join("Contents/Info.plist");
@@ -6572,7 +6660,7 @@ mod tests {
             fs::write(app.join("Electron"), "").expect("fake macOS binary should be written");
         } else if current_platform() == "win32" {
             fs::create_dir_all(&dist).expect("fake electron dist should be created");
-            fs::write(dist.join("electron.exe"), "").expect("fake exe should be written");
+            write_minimal_pe_executable(&dist.join("electron.exe"));
         } else {
             fs::create_dir_all(&dist).expect("fake electron dist should be created");
             fs::write(dist.join("electron"), "").expect("fake binary should be written");
