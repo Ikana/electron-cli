@@ -68,6 +68,7 @@ struct PackageMetadata {
     protocols: Vec<MacosProtocolPlan>,
     usage_description: BTreeMap<String, String>,
     windows_version: Option<WindowsVersionMetadata>,
+    windows_manifest: Option<WindowsManifestMetadata>,
     icon: Option<IconResource>,
     extra_resources: Vec<CopyStep>,
     darwin_dark_mode_support: bool,
@@ -79,6 +80,13 @@ struct WindowsVersionMetadata {
     strings: BTreeMap<String, String>,
     file_version: Option<String>,
     product_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WindowsManifestMetadata {
+    executable: Utf8PathBuf,
+    application_manifest: Option<Utf8PathBuf>,
+    requested_execution_level: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -907,6 +915,14 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
     if let Some(windows_version) = &report.metadata.windows_version {
         println!("  Windows version metadata: {}", windows_version.executable);
     }
+    if let Some(windows_manifest) = &report.metadata.windows_manifest {
+        if let Some(manifest) = &windows_manifest.application_manifest {
+            println!("  Windows application manifest: {manifest}");
+        }
+        if let Some(level) = &windows_manifest.requested_execution_level {
+            println!("  Windows execution level: {level}");
+        }
+    }
     if let Some(file) = &report.metadata.extend_info.file {
         println!("  extend Info.plist: {file}");
     } else if !report.metadata.extend_info.keys.is_empty() {
@@ -1623,6 +1639,14 @@ fn package_metadata(
         app_version.as_deref(),
         &mut warnings,
     )?;
+    let windows_manifest = windows_manifest_metadata(
+        root,
+        config,
+        executable_name,
+        bundle_dir,
+        platform,
+        &mut warnings,
+    )?;
     let bundle_identifier = config
         .packager
         .app_bundle_id
@@ -1654,6 +1678,7 @@ fn package_metadata(
             protocols: config.packager.protocols.clone(),
             usage_description: config.packager.usage_description.clone(),
             windows_version,
+            windows_manifest,
             icon,
             extra_resources,
             darwin_dark_mode_support: config.packager.darwin_dark_mode_support,
@@ -1678,16 +1703,6 @@ fn windows_version_metadata(
     let win32 = &config.packager.win32_metadata;
     if win32.invalid_type {
         warnings.push("packagerConfig.win32metadata must be an object.".to_string());
-    }
-    if win32.application_manifest.is_some() {
-        warnings.push(
-            "packagerConfig.win32metadata.application-manifest is recognized but Rust-native Windows manifest replacement is not implemented yet.".to_string(),
-        );
-    }
-    if win32.requested_execution_level.is_some() {
-        warnings.push(
-            "packagerConfig.win32metadata.requested-execution-level is recognized but Rust-native Windows manifest editing is not implemented yet.".to_string(),
-        );
     }
 
     let mut strings = BTreeMap::new();
@@ -1740,6 +1755,64 @@ fn windows_version_metadata(
         file_version,
         product_version: app_version.map(ToOwned::to_owned),
     }))
+}
+
+fn windows_manifest_metadata(
+    root: &Path,
+    config: &PackageJsonConfig,
+    executable_name: &str,
+    bundle_dir: &Path,
+    platform: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Option<WindowsManifestMetadata>> {
+    if platform != "win32" {
+        return Ok(None);
+    }
+
+    let win32 = &config.packager.win32_metadata;
+    if win32.application_manifest.is_none() && win32.requested_execution_level.is_none() {
+        return Ok(None);
+    }
+    if win32.application_manifest.is_some() && win32.requested_execution_level.is_some() {
+        warnings.push(
+            "packagerConfig.win32metadata.application-manifest and requested-execution-level are mutually exclusive; packaging will fail until only one is configured.".to_string(),
+        );
+    }
+    if let Some(level) = &win32.requested_execution_level {
+        if !is_valid_windows_execution_level(level) {
+            warnings.push(format!(
+                "packagerConfig.win32metadata.requested-execution-level must be one of asInvoker, highestAvailable, or requireAdministrator: {level}."
+            ));
+        }
+    }
+
+    let application_manifest = win32
+        .application_manifest
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| utf8_path(resolve_project_path(root, path)))
+        .transpose()?;
+    if let Some(path) = &application_manifest {
+        if !Path::new(path.as_str()).exists() {
+            warnings.push(format!(
+                "Configured Windows application manifest does not exist and packaging will fail: {}.",
+                path
+            ));
+        }
+    }
+
+    Ok(Some(WindowsManifestMetadata {
+        executable: utf8_path(bundle_dir.join(executable_name))?,
+        application_manifest,
+        requested_execution_level: win32.requested_execution_level.clone(),
+    }))
+}
+
+fn is_valid_windows_execution_level(level: &str) -> bool {
+    matches!(
+        level,
+        "asInvoker" | "highestAvailable" | "requireAdministrator"
+    )
 }
 
 fn insert_non_empty(map: &mut BTreeMap<String, String>, key: &str, value: Option<&str>) {
@@ -3242,8 +3315,10 @@ fn apply_windows_metadata(report: &PackageReport) -> Result<()> {
         .as_ref()
         .map(|icon| Path::new(icon.from.as_str()));
     let version = report.metadata.windows_version.as_ref();
+    let manifest = report.metadata.windows_manifest.as_ref();
     let executable = version
         .map(|metadata| Path::new(metadata.executable.as_str()))
+        .or_else(|| manifest.map(|metadata| Path::new(metadata.executable.as_str())))
         .or_else(|| {
             report
                 .metadata
@@ -3255,18 +3330,19 @@ fn apply_windows_metadata(report: &PackageReport) -> Result<()> {
         return Ok(());
     };
 
-    apply_windows_executable_resources(executable, icon, version)
+    apply_windows_executable_resources(executable, icon, version, manifest)
 }
 
 #[cfg(test)]
 fn apply_windows_executable_icon(executable: &Path, icon: &Path) -> Result<()> {
-    apply_windows_executable_resources(executable, Some(icon), None)
+    apply_windows_executable_resources(executable, Some(icon), None, None)
 }
 
 fn apply_windows_executable_resources(
     executable: &Path,
     icon: Option<&Path>,
     version_metadata: Option<&WindowsVersionMetadata>,
+    manifest_metadata: Option<&WindowsManifestMetadata>,
 ) -> Result<()> {
     let icon_data = icon
         .map(|icon| {
@@ -3292,6 +3368,9 @@ fn apply_windows_executable_resources(
     }
     if let Some(version_metadata) = version_metadata {
         apply_windows_version_info(&mut resources, version_metadata)?;
+    }
+    if let Some(manifest_metadata) = manifest_metadata {
+        apply_windows_manifest(&mut resources, manifest_metadata)?;
     }
     image
         .set_resource_directory(resources)
@@ -3334,6 +3413,58 @@ fn apply_windows_version_info(
     resources
         .set_version_info(&version_info)
         .context("Could not update Windows executable version information")
+}
+
+fn apply_windows_manifest(
+    resources: &mut editpe::ResourceDirectory,
+    metadata: &WindowsManifestMetadata,
+) -> Result<()> {
+    match (
+        metadata.application_manifest.as_ref(),
+        metadata.requested_execution_level.as_ref(),
+    ) {
+        (Some(_), Some(_)) => {
+            bail!(
+                "packagerConfig.win32metadata.application-manifest and requested-execution-level are mutually exclusive."
+            );
+        }
+        (Some(manifest), None) => {
+            let manifest_text = fs::read_to_string(manifest.as_str()).with_context(|| {
+                format!("Could not read Windows application manifest {}", manifest)
+            })?;
+            resources
+                .set_manifest(&manifest_text)
+                .context("Could not update Windows executable manifest")?;
+        }
+        (None, Some(level)) => {
+            if !is_valid_windows_execution_level(level) {
+                bail!(
+                    "packagerConfig.win32metadata.requested-execution-level must be one of asInvoker, highestAvailable, or requireAdministrator: {}.",
+                    level
+                );
+            }
+            let current_manifest = resources
+                .get_manifest()
+                .context("Could not read Windows executable manifest")?
+                .context(
+                    "packagerConfig.win32metadata.requested-execution-level requires an existing Windows executable manifest resource",
+                )?;
+            let manifest_text = replace_windows_requested_execution_level(&current_manifest, level);
+            resources
+                .set_manifest(&manifest_text)
+                .context("Could not update Windows executable manifest")?;
+        }
+        (None, None) => {}
+    }
+
+    Ok(())
+}
+
+fn replace_windows_requested_execution_level(manifest: &str, level: &str) -> String {
+    manifest.replace(
+        r#"<requestedExecutionLevel level="asInvoker" uiAccess="false"/>"#,
+        &format!(r#"<requestedExecutionLevel level="{level}" uiAccess="false"/>"#),
+    )
 }
 
 fn ensure_windows_version_info_tables(version_info: &mut editpe::VersionInfo) {
@@ -5223,6 +5354,109 @@ mod tests {
     }
 
     #[test]
+    fn plans_windows_manifest_metadata_from_packager_config() {
+        let root = unique_temp_dir("windows-manifest-plan");
+        write_windows_manifest_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+        fs::create_dir_all(root.join("assets")).expect("assets should be created");
+        fs::write(
+            root.join("assets/starter.manifest"),
+            default_windows_manifest(),
+        )
+        .expect("manifest should be written");
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("win32".to_string()),
+            arch: None,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        let windows_manifest = report
+            .metadata
+            .windows_manifest
+            .as_ref()
+            .expect("Windows manifest metadata should be planned");
+        assert!(windows_manifest
+            .executable
+            .as_str()
+            .ends_with(report.executable_name.as_str()));
+        assert!(windows_manifest
+            .application_manifest
+            .as_ref()
+            .expect("application manifest should be planned")
+            .as_str()
+            .ends_with("starter.manifest"));
+        assert_eq!(windows_manifest.requested_execution_level, None);
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Windows manifest")
+                && warning.contains("not implemented")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn warns_for_conflicting_windows_manifest_metadata() {
+        let root = unique_temp_dir("windows-manifest-conflict");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name": "starter-app",
+                "version": "1.0.0",
+                "main": "src/main.js",
+                "devDependencies": { "electron": "30.0.0" },
+                "electronCli": {
+                    "packagerConfig": {
+                        "win32metadata": {
+                            "application-manifest": "assets/starter.manifest",
+                            "requested-execution-level": "highestAvailable"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+        fs::create_dir_all(root.join("assets")).expect("assets should be created");
+        fs::write(
+            root.join("assets/starter.manifest"),
+            default_windows_manifest(),
+        )
+        .expect("manifest should be written");
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("win32".to_string()),
+            arch: None,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("application-manifest")
+                && warning.contains("requested-execution-level")
+                && warning.contains("mutually exclusive")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn embeds_windows_icon_into_portable_executable() {
         let root = unique_temp_dir("windows-icon-embed");
         fs::create_dir_all(root.join("assets")).expect("assets should be created");
@@ -5263,7 +5497,7 @@ mod tests {
             product_version: Some("5.6".to_string()),
         };
 
-        apply_windows_executable_resources(&executable, None, Some(&metadata))
+        apply_windows_executable_resources(&executable, None, Some(&metadata), None)
             .expect("version metadata should be embedded");
 
         let image = editpe::Image::parse_file(&executable).expect("executable should parse");
@@ -5307,6 +5541,74 @@ mod tests {
             strings.get("ProductName").map(String::as_str),
             Some("Starter Suite")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn embeds_windows_application_manifest_into_portable_executable() {
+        let root = unique_temp_dir("windows-manifest-embed");
+        fs::create_dir_all(root.join("assets")).expect("assets should be created");
+        let executable = root.join("starter.exe");
+        let manifest = root.join("assets/admin.manifest");
+        write_minimal_pe_executable(&executable);
+        fs::write(&manifest, administrator_windows_manifest()).expect("manifest should be written");
+        let metadata = WindowsManifestMetadata {
+            executable: utf8_path(executable.clone()).expect("path should be UTF-8"),
+            application_manifest: Some(utf8_path(manifest).expect("path should be UTF-8")),
+            requested_execution_level: None,
+        };
+
+        apply_windows_executable_resources(&executable, None, None, Some(&metadata))
+            .expect("manifest should be embedded");
+
+        let image = editpe::Image::parse_file(&executable).expect("executable should parse");
+        let resources = image
+            .resource_directory()
+            .expect("resource directory should exist");
+        let manifest = resources
+            .get_manifest()
+            .expect("manifest should be readable")
+            .expect("manifest should exist");
+        assert!(manifest.contains(r#"requestedExecutionLevel level="requireAdministrator""#));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn updates_windows_requested_execution_level_in_portable_executable() {
+        let root = unique_temp_dir("windows-execution-level");
+        fs::create_dir_all(root.join("assets")).expect("assets should be created");
+        let executable = root.join("starter.exe");
+        let manifest = root.join("assets/default.manifest");
+        write_minimal_pe_executable(&executable);
+        fs::write(&manifest, default_windows_manifest()).expect("manifest should be written");
+        let initial_metadata = WindowsManifestMetadata {
+            executable: utf8_path(executable.clone()).expect("path should be UTF-8"),
+            application_manifest: Some(utf8_path(manifest).expect("path should be UTF-8")),
+            requested_execution_level: None,
+        };
+        apply_windows_executable_resources(&executable, None, None, Some(&initial_metadata))
+            .expect("initial manifest should be embedded");
+        let metadata = WindowsManifestMetadata {
+            executable: utf8_path(executable.clone()).expect("path should be UTF-8"),
+            application_manifest: None,
+            requested_execution_level: Some("highestAvailable".to_string()),
+        };
+
+        apply_windows_executable_resources(&executable, None, None, Some(&metadata))
+            .expect("execution level should be updated");
+
+        let image = editpe::Image::parse_file(&executable).expect("executable should parse");
+        let resources = image
+            .resource_directory()
+            .expect("resource directory should exist");
+        let manifest = resources
+            .get_manifest()
+            .expect("manifest should be readable")
+            .expect("manifest should exist");
+        assert!(manifest.contains(r#"requestedExecutionLevel level="highestAvailable""#));
+        assert!(!manifest.contains(r#"requestedExecutionLevel level="asInvoker""#));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -6474,6 +6776,29 @@ mod tests {
         .expect("package.json should be written");
     }
 
+    fn write_windows_manifest_package_json(root: &Path) {
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name": "starter-app",
+                "productName": "Starter Pro",
+                "version": "2.3.4",
+                "main": "src/main.js",
+                "devDependencies": {
+                    "electron": "30.0.0"
+                },
+                "electronCli": {
+                    "packagerConfig": {
+                        "win32metadata": {
+                            "application-manifest": "assets/starter.manifest"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("package.json should be written");
+    }
+
     fn write_app_file(root: &Path) {
         fs::create_dir_all(root.join("src")).expect("src should be created");
         fs::write(root.join("src/main.js"), "console.log('hello');")
@@ -6496,6 +6821,34 @@ mod tests {
         fs::write(root.join("assets/starter.icns"), b"icns").expect("icon should be written");
         fs::write(root.join("assets/starter.ico"), minimal_ico()).expect("icon should be written");
         fs::write(root.join("assets/config.json"), "{}").expect("resource should be written");
+    }
+
+    fn default_windows_manifest() -> &'static str {
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>
+"#
+    }
+
+    fn administrator_windows_manifest() -> &'static str {
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>
+"#
     }
 
     fn minimal_ico() -> Vec<u8> {
