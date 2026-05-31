@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use apple_codesign::{BundleSigner, CodeSignatureFlags, SettingsScope, SigningSettings};
 use camino::Utf8PathBuf;
 use plist::{Dictionary as PlistDictionary, Value as PlistValue};
 use serde::Serialize;
@@ -71,6 +72,8 @@ struct MacosSigningPlan {
 struct MacosSignPlan {
     configured: bool,
     enabled: bool,
+    will_execute: bool,
+    method: Option<String>,
     identity: Option<String>,
     entitlements: Vec<Utf8PathBuf>,
     entitlements_inherit: Option<Utf8PathBuf>,
@@ -363,8 +366,109 @@ pub(crate) fn execute_package(report: &PackageReport, force: bool) -> Result<()>
         &app_dir,
         &report.project,
     )?;
+    execute_macos_signing(report)?;
 
     Ok(())
+}
+
+fn execute_macos_signing(report: &PackageReport) -> Result<()> {
+    if report.platform != "darwin" || !report.signing.macos.sign.will_execute {
+        return Ok(());
+    }
+
+    let bundle_dir = Path::new(report.bundle_dir.as_str());
+    let bundle_parent = bundle_dir
+        .parent()
+        .context("macOS bundle output has no parent directory")?;
+    let bundle_name = bundle_dir
+        .file_name()
+        .context("macOS bundle output has no bundle directory name")?;
+    let unique_suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos();
+    let signing_parent = bundle_parent.join(format!(
+        ".electron-cli-signing-{}-{unique_suffix}",
+        std::process::id()
+    ));
+    let signed_bundle_dir = signing_parent.join(bundle_name);
+
+    if signing_parent.exists() {
+        fs::remove_dir_all(&signing_parent)
+            .with_context(|| format!("Could not remove {}", signing_parent.display()))?;
+    }
+
+    let signing_result = (|| -> Result<()> {
+        let mut signer = BundleSigner::new_from_path(bundle_dir).with_context(|| {
+            format!(
+                "Could not prepare macOS bundle signing for {}",
+                bundle_dir.display()
+            )
+        })?;
+        signer
+            .collect_nested_bundles()
+            .context("Could not discover nested macOS bundles for signing")?;
+
+        let settings = macos_signing_settings(report)?;
+        signer
+            .write_signed_bundle(&signed_bundle_dir, &settings)
+            .with_context(|| {
+                format!(
+                    "Could not write signed macOS bundle to {}",
+                    signed_bundle_dir.display()
+                )
+            })?;
+
+        Ok(())
+    })();
+
+    if let Err(error) = signing_result {
+        let _ = fs::remove_dir_all(&signing_parent);
+        return Err(error);
+    }
+
+    fs::remove_dir_all(bundle_dir)
+        .with_context(|| format!("Could not remove {}", bundle_dir.display()))?;
+    fs::rename(&signed_bundle_dir, bundle_dir).with_context(|| {
+        format!(
+            "Could not move signed macOS bundle from {} to {}",
+            signed_bundle_dir.display(),
+            bundle_dir.display()
+        )
+    })?;
+    let _ = fs::remove_dir_all(&signing_parent);
+
+    Ok(())
+}
+
+fn macos_signing_settings(report: &PackageReport) -> Result<SigningSettings<'static>> {
+    let sign = &report.signing.macos.sign;
+    let mut settings = SigningSettings::default();
+    settings.set_binary_identifier(SettingsScope::Main, &report.metadata.bundle_identifier);
+
+    if sign.hardened_runtime.unwrap_or(false) {
+        settings.add_code_signature_flags(SettingsScope::Main, CodeSignatureFlags::RUNTIME);
+    }
+
+    if let Some(entitlements) = sign.entitlements.first() {
+        let entitlements_path = Path::new(entitlements.as_str());
+        let entitlements_xml = fs::read_to_string(entitlements_path).with_context(|| {
+            format!(
+                "Could not read macOS entitlements file {}",
+                entitlements_path.display()
+            )
+        })?;
+        settings
+            .set_entitlements_xml(SettingsScope::Main, entitlements_xml)
+            .with_context(|| {
+                format!(
+                    "Could not parse macOS entitlements file {}",
+                    entitlements_path.display()
+                )
+            })?;
+    }
+
+    Ok(settings)
 }
 
 fn print_report(report: &PackageReport, json: bool) -> Result<()> {
@@ -403,6 +507,17 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
         if let Some(identity) = &report.signing.macos.sign.identity {
             println!("  identity: {identity}");
         }
+        if let Some(method) = &report.signing.macos.sign.method {
+            println!("  signing method: {method}");
+        }
+        println!(
+            "  signing execution: {}",
+            if report.signing.macos.sign.will_execute {
+                "enabled"
+            } else {
+                "not available"
+            }
+        );
         println!(
             "  macOS notarization: {}",
             if report.signing.macos.notarize.enabled {
@@ -720,20 +835,59 @@ fn macos_sign_plan(
         .filter(|path| !path.trim().is_empty())
         .map(|path| utf8_path(resolve_project_path(root, path)))
         .transpose()?;
+    if let Some(path) = &entitlements_inherit {
+        if !Path::new(path.as_str()).exists() {
+            warnings.push(format!(
+                "Configured macOS inherited entitlements file does not exist: {}.",
+                path
+            ));
+        }
+    }
+
+    let identity = config.identity.as_deref().map(str::trim);
+    let ad_hoc_identity = matches!(identity, None | Some("-"));
+    let will_execute = config.enabled && platform == "darwin" && ad_hoc_identity;
+    let method = if config.enabled && platform == "darwin" {
+        if ad_hoc_identity {
+            Some("ad-hoc".to_string())
+        } else {
+            Some("certificate-identity".to_string())
+        }
+    } else {
+        None
+    };
 
     if config.configured && platform != "darwin" {
         warnings.push(format!(
             "macOS signing is configured but ignored for target platform {platform}."
         ));
-    } else if config.enabled {
+    } else if config.enabled && !will_execute {
         warnings.push(
-            "macOS signing is configured, but Rust-native signing is not implemented yet; package output will be unsigned.".to_string(),
+            "macOS signing identity is configured, but Rust-native certificate/keychain signing is not implemented yet; package output will be unsigned. Use identity '-' or omit identity for experimental ad-hoc signing.".to_string(),
         );
+    } else if will_execute {
+        if config.entitlements.len() > 1 {
+            warnings.push(
+                "Rust-native ad-hoc signing applies the first macOS entitlements file only; inherited/login-helper entitlement scoping is not implemented yet.".to_string(),
+            );
+        }
+        if config.entitlements_inherit.is_some() {
+            warnings.push(
+                "packagerConfig.osxSign.entitlementsInherit is recognized but not applied to nested bundles by Rust-native ad-hoc signing yet.".to_string(),
+            );
+        }
+        if config.gatekeeper_assess.is_some() {
+            warnings.push(
+                "packagerConfig.osxSign.gatekeeperAssess is recognized but Gatekeeper assessment is not implemented yet.".to_string(),
+            );
+        }
     }
 
     Ok(MacosSignPlan {
         configured: config.configured,
         enabled: config.enabled,
+        will_execute,
+        method,
         identity: config.identity.clone(),
         entitlements,
         entitlements_inherit,
@@ -767,6 +921,23 @@ fn macos_notarize_plan(
     if config.enabled && !package_config.packager.osx_sign.enabled {
         warnings.push(
             "macOS notarization requires packagerConfig.osxSign to be enabled first.".to_string(),
+        );
+    }
+    if config.enabled
+        && platform == "darwin"
+        && package_config.packager.osx_sign.enabled
+        && matches!(
+            package_config
+                .packager
+                .osx_sign
+                .identity
+                .as_deref()
+                .map(str::trim),
+            None | Some("-")
+        )
+    {
+        warnings.push(
+            "macOS notarization requires a Developer ID signature; Rust-native ad-hoc signing is not notarizable.".to_string(),
         );
     }
     if config.enabled && auth_method.is_none() {
@@ -1134,6 +1305,7 @@ fn apply_macos_metadata(report: &PackageReport) -> Result<()> {
         "CFBundleIdentifier",
         &report.metadata.bundle_identifier,
     );
+    set_plist_string(&mut dictionary, "CFBundlePackageType", "APPL");
 
     if let Some(version) = &report.metadata.app_version {
         set_plist_string(&mut dictionary, "CFBundleShortVersionString", version);
@@ -1816,6 +1988,11 @@ mod tests {
 
         assert!(report.signing.macos.sign.configured);
         assert!(report.signing.macos.sign.enabled);
+        assert!(!report.signing.macos.sign.will_execute);
+        assert_eq!(
+            report.signing.macos.sign.method.as_deref(),
+            Some("certificate-identity")
+        );
         assert_eq!(
             report.signing.macos.sign.identity.as_deref(),
             Some("Developer ID Application: Example, Inc. (TEAMID1234)")
@@ -1831,7 +2008,7 @@ mod tests {
         assert!(report
             .warnings
             .iter()
-            .any(|warning| warning.contains("Rust-native signing is not implemented")));
+            .any(|warning| warning.contains("Rust-native certificate/keychain signing")));
         assert!(report
             .warnings
             .iter()
@@ -1841,6 +2018,54 @@ mod tests {
         assert!(!json.contains("SECRET_KEY_ID"));
         assert!(!json.contains("SECRET_ISSUER_ID"));
         assert!(!json.contains("secret api key"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plans_macos_ad_hoc_signing_execution() {
+        let root = unique_temp_dir("macos-ad-hoc-signing-plan");
+        write_package_json(&root);
+        fs::write(
+            root.join("forge.config.js"),
+            r#"
+            module.exports = {
+              packagerConfig: {
+                osxSign: {
+                  identity: '-',
+                  hardenedRuntime: true,
+                },
+              },
+            };
+            "#,
+        )
+        .expect("forge config should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("darwin".to_string()),
+            arch: Some("arm64".to_string()),
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.signing.macos.sign.configured);
+        assert!(report.signing.macos.sign.enabled);
+        assert!(report.signing.macos.sign.will_execute);
+        assert_eq!(report.signing.macos.sign.method.as_deref(), Some("ad-hoc"));
+        assert_eq!(report.signing.macos.sign.identity.as_deref(), Some("-"));
+        assert_eq!(report.signing.macos.sign.hardened_runtime, Some(true));
+        assert!(!report.warnings.iter().any(|warning| {
+            warning.contains("Rust-native certificate/keychain signing")
+                || warning.contains("Rust-native signing is not implemented")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1948,6 +2173,10 @@ mod tests {
             Some("com.example.starter")
         );
         assert_eq!(
+            plist_string(dictionary, "CFBundlePackageType"),
+            Some("APPL")
+        );
+        assert_eq!(
             plist_string(dictionary, "CFBundleShortVersionString"),
             Some("2.3.4")
         );
@@ -1966,6 +2195,59 @@ mod tests {
                 .and_then(PlistValue::as_boolean),
             Some(false)
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn packages_macos_bundle_with_ad_hoc_signature() {
+        if current_platform() != "darwin" {
+            return;
+        }
+
+        let root = unique_temp_dir("macos-ad-hoc-signing-execute");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"starter-app","version":"0.1.0","main":"src/main.js","devDependencies":{"electron":"30.0.0"},"electronCli":{"packagerConfig":{"appBundleId":"com.example.signed","osxSign":true}}}"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_macho_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.signing.macos.sign.will_execute);
+        assert_eq!(report.signing.macos.sign.method.as_deref(), Some("ad-hoc"));
+        assert!(report.warnings.is_empty());
+
+        execute_package(&report, false).expect("package should succeed");
+
+        let bundle_dir = Path::new(report.bundle_dir.as_str());
+        assert!(bundle_dir
+            .join("Contents/_CodeSignature/CodeResources")
+            .exists());
+
+        let executable = bundle_dir
+            .join("Contents/MacOS")
+            .join(&report.executable_name);
+        let executable_data = fs::read(executable).expect("signed executable should read");
+        let macho = apple_codesign::MachFile::parse(&executable_data)
+            .expect("signed executable should parse as Mach-O");
+        assert!(macho.iter_macho().all(|binary| binary
+            .code_signature()
+            .expect("code signature should parse")
+            .is_some()));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2121,6 +2403,16 @@ mod tests {
             fs::create_dir_all(&dist).expect("fake electron dist should be created");
             fs::write(dist.join("electron"), "").expect("fake binary should be written");
         }
+    }
+
+    fn write_macho_electron_dist(root: &Path) {
+        let app = root.join("node_modules/electron/dist/Electron.app/Contents/MacOS");
+        fs::create_dir_all(&app).expect("macOS Electron app should be created");
+        fs::copy(
+            std::env::current_exe().expect("current test executable should resolve"),
+            app.join("Electron"),
+        )
+        .expect("Mach-O test executable should be copied");
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

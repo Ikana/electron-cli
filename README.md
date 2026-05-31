@@ -35,15 +35,15 @@ The Rust-native flow currently owns:
 
 - `init --template minimal`: writes a local Electron starter without Electron Forge.
 - `start`: launches the installed Electron runtime directly.
-- `package`: copies the installed Electron runtime, app files, installed production dependency closure, app metadata, macOS icon, and extra resources into a local app bundle for the current platform and architecture; it reads package metadata from `package.json`, JSON-shaped Forge config, and static Forge config files.
+- `package`: copies the installed Electron runtime, app files, installed production dependency closure, app metadata, macOS icon, and extra resources into a local app bundle for the current platform and architecture; it reads package metadata from `package.json`, JSON-shaped Forge config, and static Forge config files, and can apply experimental Rust-native ad-hoc macOS bundle signatures.
 - `make`: runs `package` and writes distributables under `out/make/<target>/<platform>/<arch>/`; it reads JSON-shaped `config.forge.makers` / `electronCli.makers` arrays and static Forge config files when `--target` is omitted, and `--target` still forces one maker. ZIP works on all platforms, `--target dmg` writes a basic macOS disk image, `--target deb` / `--target rpm` write Linux packages, and `--target msi` writes a basic Windows Installer package.
 - `publish`: runs `make` and publishes distributables to a local directory with a manifest or to GitHub Releases; it reads JSON-shaped `config.forge.publishers` / `electronCli.publishers` arrays and static Forge config files when `--publisher` is omitted, and `--publisher` still forces one publisher.
 
 The GitHub publisher creates or reuses a release, uploads selected make artifacts, and can replace an existing asset with `--force`. It reads `GITHUB_TOKEN` or `GH_TOKEN` and can infer `OWNER/REPO` from package metadata, Forge GitHub publisher config, or `package.json` `repository`. You can also pass `--github-repo`.
 
-The package command recognizes macOS `packagerConfig.osxSign` and `packagerConfig.osxNotarize` options and reports the signing/notarization plan without serializing credential values. Actual Rust-native signing and notarization execution is not implemented yet.
+The package command recognizes macOS `packagerConfig.osxSign` and `packagerConfig.osxNotarize` options and reports the signing/notarization plan without serializing credential values. When `osxSign` is enabled on macOS and no certificate identity is configured, or the identity is `"-"`, `package` writes an experimental Rust-native ad-hoc signature for the generated `.app` bundle. Developer ID certificate/keychain signing and notarization execution are not implemented yet.
 
-The DMG maker is currently a pure-Rust FAT32 image with the app bundle and an Applications entry. The MSI maker writes a compressed embedded CAB, Windows Installer database tables, and a Start Menu shortcut when the packaged executable is present. HFS+/APFS DMG layout customization, installer UI customization, Windows/Linux icon embedding, signing execution, and notarization execution are still TODO.
+The DMG maker is currently a pure-Rust FAT32 image with the app bundle and an Applications entry. The MSI maker writes a compressed embedded CAB, Windows Installer database tables, and a Start Menu shortcut when the packaged executable is present. HFS+/APFS DMG layout customization, installer UI customization, Windows/Linux icon embedding, Developer ID signing execution, and notarization execution are still TODO.
 
 Package metadata can be configured in `package.json`:
 
@@ -57,7 +57,7 @@ Package metadata can be configured in `package.json`:
       "icon": "assets/icon",
       "extraResource": "assets/config.json",
       "osxSign": {
-        "identity": "Developer ID Application: Example, Inc. (TEAMID1234)",
+        "identity": "-",
         "entitlements": "assets/entitlements.plist",
         "hardenedRuntime": true
       },
@@ -96,6 +96,8 @@ Package metadata can be configured in `package.json`:
   }
 }
 ```
+
+Set `identity` to a Developer ID certificate name when you want the plan to reflect Forge-style release signing, but this project will report it as not executable until Rust-native certificate/keychain signing exists. Use `identity: "-"` or omit `identity` for the current ad-hoc signing path.
 
 The package command also reads JSON-shaped `config.forge.packagerConfig` and `electronPackagerConfig` entries for the same fields. The make command maps JSON-shaped Forge maker names to the Rust-native targets it supports: zip, dmg, deb, rpm, and wix/msi. The publish command maps JSON-shaped publisher names to local and GitHub.
 
