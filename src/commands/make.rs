@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     fs::File,
     io::{self, BufWriter, Cursor, Write},
@@ -6,13 +7,16 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use cab::{CabinetBuilder, CompressionType as CabCompressionType};
 use camino::Utf8PathBuf;
 use fatfs::{Dir as FatDir, FileSystem, FormatVolumeOptions, FsOptions, ReadWriteSeek};
 use flate2::{write::GzEncoder, Compression};
 use fscommon::BufStream;
+use msi::{Column, Insert, Language, Package, PackageType, Value};
 use rpm::{BuildConfig, CompressionType, FileOptions, PackageBuilder};
 use serde::Serialize;
 use tar::{Builder as TarBuilder, Header as TarHeader};
+use uuid::Uuid;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use crate::{
@@ -88,6 +92,12 @@ pub(crate) fn build_report(args: &MakeArgs) -> Result<MakeReport> {
             package.platform()
         ));
     }
+    if args.target == MakeTarget::Msi && package.platform() != "win32" {
+        warnings.push(format!(
+            "msi maker only supports Windows packages; target platform is {}.",
+            package.platform()
+        ));
+    }
     if args.skip_package && !Path::new(package.bundle_dir().as_str()).exists() {
         warnings.push(format!(
             "Package output does not exist: {}.",
@@ -147,6 +157,7 @@ pub(crate) fn execute_make(report: &mut MakeReport, args: &MakeArgs) -> Result<(
         }
         MakeTarget::Deb => write_deb_archive(&report.package, artifact)?,
         MakeTarget::Dmg => write_dmg_archive(&report.package, artifact)?,
+        MakeTarget::Msi => write_msi_archive(&report.package, artifact)?,
         MakeTarget::Rpm => write_rpm_archive(&report.package, artifact)?,
     }
 
@@ -212,6 +223,12 @@ fn make_artifact_path(make_dir: &Path, package: &PackageReport, target: MakeTarg
             package.artifact_stem(),
             dmg_version(package.project().version.as_deref()),
             package.arch()
+        )),
+        MakeTarget::Msi => make_dir.join(format!(
+            "{}-{}-{}.msi",
+            package.artifact_stem(),
+            windows_artifact_version(package.project().version.as_deref()),
+            windows_arch(package.arch())
         )),
         MakeTarget::Rpm => make_dir.join(format!(
             "{}-{}-1.{}.rpm",
@@ -655,6 +672,627 @@ fn write_rpm_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
         .with_context(|| format!("Could not write {}", artifact.display()))
 }
 
+#[derive(Debug)]
+struct MsiPayload {
+    directories: Vec<MsiDirectoryEntry>,
+    files: Vec<MsiFileEntry>,
+    shortcut_component: Option<String>,
+    shortcut_target_file: Option<String>,
+}
+
+#[derive(Debug)]
+struct MsiDirectoryEntry {
+    id: String,
+    parent_id: String,
+    name: String,
+}
+
+#[derive(Debug)]
+struct MsiFileEntry {
+    id: String,
+    component_id: String,
+    component_guid: String,
+    directory_id: String,
+    source: PathBuf,
+    file_name: String,
+    cabinet_name: String,
+    size: i32,
+    sequence: i32,
+}
+
+fn write_msi_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
+    if package.platform() != "win32" {
+        bail!(
+            "MSI maker only supports Windows packages. Requested {}.",
+            package.platform()
+        );
+    }
+
+    let source = Path::new(package.bundle_dir().as_str());
+    if !source.exists() {
+        bail!("Package output does not exist: {}", source.display());
+    }
+
+    let parent = artifact
+        .parent()
+        .with_context(|| format!("Artifact path has no parent: {}", artifact.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("Could not create {}", parent.display()))?;
+
+    let payload = collect_msi_payload(package, source)?;
+    if payload.files.is_empty() {
+        bail!(
+            "MSI maker requires at least one packaged file in {}",
+            source.display()
+        );
+    }
+
+    let cabinet = create_msi_cabinet(&payload)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(artifact)
+        .with_context(|| format!("Could not create {}", artifact.display()))?;
+    let mut installer =
+        Package::create(PackageType::Installer, file).context("Could not create MSI package")?;
+
+    write_msi_summary(&mut installer, package)?;
+    create_msi_tables(&mut installer)?;
+    insert_msi_rows(&mut installer, package, &payload)?;
+    {
+        let mut stream = installer
+            .write_stream("app.cab")
+            .context("Could not create embedded MSI cabinet stream")?;
+        stream
+            .write_all(&cabinet)
+            .context("Could not write embedded MSI cabinet stream")?;
+    }
+    installer.flush().context("Could not flush MSI package")?;
+    installer
+        .into_inner()
+        .context("Could not finish MSI package")?;
+
+    Ok(())
+}
+
+fn write_msi_summary(installer: &mut Package<File>, package: &PackageReport) -> Result<()> {
+    let package_code = deterministic_guid(
+        "package-code",
+        &[
+            package.app_name(),
+            package.project().version.as_deref().unwrap_or("0.1.0"),
+            package.arch(),
+        ],
+    );
+    let arch = msi_summary_arch(package.arch());
+    let language = Language::from_code(1033);
+    let summary = installer.summary_info_mut();
+    summary.set_title(format!("{} Installer", package.app_name()));
+    summary.set_subject(package.app_name().to_string());
+    summary.set_author("electron-cli".to_string());
+    summary.set_comments(format!(
+        "{} packaged by electron-cli.",
+        single_line(package.app_name())
+    ));
+    summary.set_creating_application("electron-cli".to_string());
+    summary.set_uuid(package_code);
+    summary.set_arch(arch.to_string());
+    summary.set_languages(&[language]);
+    summary.set_page_count(200);
+    summary.set_word_count(2);
+    Ok(())
+}
+
+fn create_msi_tables(installer: &mut Package<File>) -> Result<()> {
+    create_msi_table(
+        installer,
+        "Property",
+        vec![
+            Column::build("Property").primary_key().id_string(72),
+            Column::build("Value").nullable().formatted_string(0),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "Directory",
+        vec![
+            Column::build("Directory").primary_key().id_string(72),
+            Column::build("Directory_Parent").nullable().id_string(72),
+            Column::build("DefaultDir").text_string(255),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "Feature",
+        vec![
+            Column::build("Feature").primary_key().id_string(38),
+            Column::build("Feature_Parent").nullable().id_string(38),
+            Column::build("Title").nullable().text_string(64),
+            Column::build("Description").nullable().text_string(255),
+            Column::build("Display").nullable().int16(),
+            Column::build("Level").int16(),
+            Column::build("Directory_").nullable().id_string(72),
+            Column::build("Attributes").int16(),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "Component",
+        vec![
+            Column::build("Component").primary_key().id_string(72),
+            Column::build("ComponentId").nullable().string(38),
+            Column::build("Directory_").id_string(72),
+            Column::build("Attributes").int16(),
+            Column::build("Condition").nullable().formatted_string(255),
+            Column::build("KeyPath").nullable().id_string(72),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "FeatureComponents",
+        vec![
+            Column::build("Feature_").primary_key().id_string(38),
+            Column::build("Component_").primary_key().id_string(72),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "File",
+        vec![
+            Column::build("File").primary_key().id_string(72),
+            Column::build("Component_").id_string(72),
+            Column::build("FileName").text_string(255),
+            Column::build("FileSize").int32(),
+            Column::build("Version").nullable().string(72),
+            Column::build("Language").nullable().string(20),
+            Column::build("Attributes").nullable().int16(),
+            Column::build("Sequence").int16(),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "Media",
+        vec![
+            Column::build("DiskId").primary_key().int16(),
+            Column::build("LastSequence").int16(),
+            Column::build("DiskPrompt").nullable().text_string(64),
+            Column::build("Cabinet").nullable().string(255),
+            Column::build("VolumeLabel").nullable().string(32),
+            Column::build("Source").nullable().string(72),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "Shortcut",
+        vec![
+            Column::build("Shortcut").primary_key().id_string(72),
+            Column::build("Directory_").id_string(72),
+            Column::build("Name").text_string(128),
+            Column::build("Component_").id_string(72),
+            Column::build("Target").formatted_string(0),
+            Column::build("Arguments").nullable().formatted_string(255),
+            Column::build("Description").nullable().text_string(255),
+            Column::build("Hotkey").nullable().int16(),
+            Column::build("Icon_").nullable().id_string(72),
+            Column::build("IconIndex").nullable().int16(),
+            Column::build("ShowCmd").nullable().int16(),
+            Column::build("WkDir").nullable().id_string(72),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "RemoveFile",
+        vec![
+            Column::build("FileKey").primary_key().id_string(72),
+            Column::build("Component_").id_string(72),
+            Column::build("FileName").nullable().text_string(255),
+            Column::build("DirProperty").id_string(72),
+            Column::build("InstallMode").int16(),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "InstallExecuteSequence",
+        vec![
+            Column::build("Action").primary_key().id_string(72),
+            Column::build("Condition").nullable().formatted_string(255),
+            Column::build("Sequence").nullable().int16(),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "ActionText",
+        vec![
+            Column::build("Action").primary_key().id_string(72),
+            Column::build("Description").nullable().text_string(64),
+            Column::build("Template").nullable().formatted_string(128),
+        ],
+    )
+}
+
+fn create_msi_table(installer: &mut Package<File>, name: &str, columns: Vec<Column>) -> Result<()> {
+    installer
+        .create_table(name, columns)
+        .with_context(|| format!("Could not create MSI {name} table"))
+}
+
+fn insert_msi_rows(
+    installer: &mut Package<File>,
+    package: &PackageReport,
+    payload: &MsiPayload,
+) -> Result<()> {
+    let product_version = msi_product_version(package.project().version.as_deref());
+    let product_code = msi_guid(deterministic_guid(
+        "product-code",
+        &[package.app_name(), &product_version, package.arch()],
+    ));
+    let upgrade_code = msi_guid(deterministic_guid(
+        "upgrade-code",
+        &[
+            package.app_name(),
+            package.project().name.as_deref().unwrap_or(""),
+        ],
+    ));
+    insert_msi_table_rows(
+        installer,
+        "Property",
+        vec![
+            vec![s("ProductCode"), s(product_code)],
+            vec![s("ProductLanguage"), s("1033")],
+            vec![s("ProductName"), s(package.app_name())],
+            vec![s("ProductVersion"), s(product_version)],
+            vec![s("Manufacturer"), s("electron-cli")],
+            vec![s("UpgradeCode"), s(upgrade_code)],
+            vec![s("ALLUSERS"), s("1")],
+            vec![s("INSTALLLEVEL"), s("1")],
+        ],
+    )?;
+
+    let program_files_dir = msi_program_files_directory(package.arch());
+    let install_folder = msi_filename("APPDIR", package.app_name());
+    insert_msi_table_rows(
+        installer,
+        "Directory",
+        vec![
+            vec![s("TARGETDIR"), Value::Null, s("SourceDir")],
+            vec![s(program_files_dir), s("TARGETDIR"), s(".")],
+            vec![s("INSTALLFOLDER"), s(program_files_dir), s(install_folder)],
+            vec![s("ProgramMenuFolder"), s("TARGETDIR"), s(".")],
+            vec![
+                s("ApplicationProgramsFolder"),
+                s("ProgramMenuFolder"),
+                s(msi_filename("APPMENU", package.app_name())),
+            ],
+        ],
+    )?;
+    insert_msi_table_rows(
+        installer,
+        "Directory",
+        payload
+            .directories
+            .iter()
+            .map(|directory| {
+                vec![
+                    s(&directory.id),
+                    s(&directory.parent_id),
+                    s(&directory.name),
+                ]
+            })
+            .collect(),
+    )?;
+
+    insert_msi_table_rows(
+        installer,
+        "Feature",
+        vec![vec![
+            s("MainFeature"),
+            Value::Null,
+            s(package.app_name()),
+            s(format!("Install {}.", single_line(package.app_name()))),
+            Value::from(1),
+            Value::from(1),
+            s("INSTALLFOLDER"),
+            Value::from(0),
+        ]],
+    )?;
+
+    let component_attributes = msi_component_attributes(package.arch());
+    insert_msi_table_rows(
+        installer,
+        "Component",
+        payload
+            .files
+            .iter()
+            .map(|file| {
+                vec![
+                    s(&file.component_id),
+                    s(&file.component_guid),
+                    s(&file.directory_id),
+                    Value::from(component_attributes),
+                    Value::Null,
+                    s(&file.id),
+                ]
+            })
+            .collect(),
+    )?;
+    insert_msi_table_rows(
+        installer,
+        "FeatureComponents",
+        payload
+            .files
+            .iter()
+            .map(|file| vec![s("MainFeature"), s(&file.component_id)])
+            .collect(),
+    )?;
+    insert_msi_table_rows(
+        installer,
+        "File",
+        payload
+            .files
+            .iter()
+            .map(|file| {
+                vec![
+                    s(&file.id),
+                    s(&file.component_id),
+                    s(&file.file_name),
+                    Value::from(file.size),
+                    Value::Null,
+                    Value::Null,
+                    Value::from(0),
+                    Value::from(file.sequence),
+                ]
+            })
+            .collect(),
+    )?;
+    insert_msi_table_rows(
+        installer,
+        "Media",
+        vec![vec![
+            Value::from(1),
+            Value::from(payload.files.len() as i32),
+            Value::Null,
+            s("#app.cab"),
+            Value::Null,
+            Value::Null,
+        ]],
+    )?;
+
+    if let (Some(component), Some(target_file)) =
+        (&payload.shortcut_component, &payload.shortcut_target_file)
+    {
+        insert_msi_table_rows(
+            installer,
+            "Shortcut",
+            vec![vec![
+                s("ApplicationShortcut"),
+                s("ApplicationProgramsFolder"),
+                s(msi_filename("SHORTCUT", package.app_name())),
+                s(component),
+                s(format!("[#{target_file}]")),
+                Value::Null,
+                s(format!("Launch {}.", single_line(package.app_name()))),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                s("INSTALLFOLDER"),
+            ]],
+        )?;
+        insert_msi_table_rows(
+            installer,
+            "RemoveFile",
+            vec![vec![
+                s("RemoveStartMenuFolder"),
+                s(component),
+                Value::Null,
+                s("ApplicationProgramsFolder"),
+                Value::from(2),
+            ]],
+        )?;
+    }
+
+    insert_msi_table_rows(
+        installer,
+        "InstallExecuteSequence",
+        vec![
+            standard_action("CostInitialize", 800),
+            standard_action("FileCost", 900),
+            standard_action("CostFinalize", 1000),
+            standard_action("InstallValidate", 1400),
+            standard_action("InstallInitialize", 1500),
+            standard_action("ProcessComponents", 1600),
+            standard_action("UnpublishFeatures", 1800),
+            standard_action("RemoveShortcuts", 3200),
+            standard_action("RemoveFiles", 3500),
+            standard_action("InstallFiles", 4000),
+            standard_action("CreateShortcuts", 4500),
+            standard_action("RegisterUser", 6000),
+            standard_action("RegisterProduct", 6100),
+            standard_action("PublishFeatures", 6300),
+            standard_action("PublishProduct", 6400),
+            standard_action("InstallFinalize", 6600),
+        ],
+    )?;
+    insert_msi_table_rows(
+        installer,
+        "ActionText",
+        vec![
+            action_text(
+                "InstallFiles",
+                "Copying new files",
+                "File: [1],  Directory: [9],  Size: [6]",
+            ),
+            action_text("CreateShortcuts", "Creating shortcuts", "Shortcut: [1]"),
+            action_text("RemoveFiles", "Removing files", "File: [1], Directory: [9]"),
+            action_text("RemoveShortcuts", "Removing shortcuts", "Shortcut: [1]"),
+        ],
+    )
+}
+
+fn insert_msi_table_rows(
+    installer: &mut Package<File>,
+    table: &str,
+    rows: Vec<Vec<Value>>,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    installer
+        .insert_rows(Insert::into(table).rows(rows))
+        .with_context(|| format!("Could not insert MSI {table} rows"))
+}
+
+fn standard_action(action: &str, sequence: i32) -> Vec<Value> {
+    vec![s(action), Value::Null, Value::from(sequence)]
+}
+
+fn action_text(action: &str, description: &str, template: &str) -> Vec<Value> {
+    vec![s(action), s(description), s(template)]
+}
+
+fn collect_msi_payload(package: &PackageReport, source: &Path) -> Result<MsiPayload> {
+    let mut payload = MsiPayload {
+        directories: Vec::new(),
+        files: Vec::new(),
+        shortcut_component: None,
+        shortcut_target_file: None,
+    };
+    let mut directory_ids = BTreeMap::from([(PathBuf::new(), "INSTALLFOLDER".to_string())]);
+    collect_msi_directory(
+        package,
+        source,
+        Path::new(""),
+        "INSTALLFOLDER",
+        &mut directory_ids,
+        &mut payload,
+    )?;
+
+    if payload.files.len() > i16::MAX as usize {
+        bail!(
+            "MSI maker supports up to {} files; package contains {}.",
+            i16::MAX,
+            payload.files.len()
+        );
+    }
+
+    Ok(payload)
+}
+
+fn collect_msi_directory(
+    package: &PackageReport,
+    source: &Path,
+    relative_dir: &Path,
+    directory_id: &str,
+    directory_ids: &mut BTreeMap<PathBuf, String>,
+    payload: &mut MsiPayload,
+) -> Result<()> {
+    let mut entries = fs::read_dir(source)
+        .with_context(|| format!("Could not read {}", source.display()))?
+        .collect::<Result<Vec<_>, io::Error>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_name = utf8_file_name(&path)?.to_string();
+        let relative_path = relative_dir.join(&file_name);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("Could not stat {}", path.display()))?;
+
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "MSI maker does not support symbolic links yet: {}",
+                path.display()
+            );
+        }
+
+        if metadata.is_dir() {
+            let dir_id = format!("D{:04}", directory_ids.len());
+            directory_ids.insert(relative_path.clone(), dir_id.clone());
+            payload.directories.push(MsiDirectoryEntry {
+                id: dir_id.clone(),
+                parent_id: directory_id.to_string(),
+                name: msi_filename(&dir_id, &file_name),
+            });
+            collect_msi_directory(
+                package,
+                &path,
+                &relative_path,
+                &dir_id,
+                directory_ids,
+                payload,
+            )?;
+        } else if metadata.is_file() {
+            let sequence = payload.files.len() + 1;
+            let size = i32::try_from(metadata.len())
+                .with_context(|| format!("MSI file is too large: {}", path.display()))?;
+            let file_id = format!("F{sequence:04}");
+            let component_id = format!("C{sequence:04}");
+            let relative_key = relative_path.to_string_lossy().replace('\\', "/");
+            let component_guid = msi_guid(deterministic_guid(
+                "component",
+                &[
+                    package.app_name(),
+                    package.project().name.as_deref().unwrap_or(""),
+                    &relative_key,
+                ],
+            ));
+            let entry = MsiFileEntry {
+                id: file_id.clone(),
+                component_id: component_id.clone(),
+                component_guid,
+                directory_id: directory_id.to_string(),
+                source: path.clone(),
+                file_name: msi_filename(&file_id, &file_name),
+                cabinet_name: file_id.clone(),
+                size,
+                sequence: sequence as i32,
+            };
+
+            if file_name.eq_ignore_ascii_case(package.executable_name()) {
+                payload.shortcut_component = Some(component_id);
+                payload.shortcut_target_file = Some(file_id);
+            }
+
+            payload.files.push(entry);
+        }
+    }
+
+    Ok(())
+}
+
+fn create_msi_cabinet(payload: &MsiPayload) -> Result<Vec<u8>> {
+    let mut builder = CabinetBuilder::new();
+    {
+        let folder = builder.add_folder(CabCompressionType::MsZip);
+        for file in &payload.files {
+            folder.add_file(&file.cabinet_name);
+        }
+    }
+
+    let cursor = Cursor::new(Vec::new());
+    let mut cabinet = builder
+        .build(cursor)
+        .context("Could not start MSI cabinet")?;
+    for file in &payload.files {
+        let mut writer = cabinet
+            .next_file()
+            .context("Could not open next MSI cabinet file")?
+            .context("MSI cabinet writer finished before all files were written")?;
+        anyhow::ensure!(
+            writer.file_name() == file.cabinet_name,
+            "MSI cabinet file order drifted while writing {}",
+            file.source.display()
+        );
+        let mut source = File::open(&file.source)
+            .with_context(|| format!("Could not open {}", file.source.display()))?;
+        io::copy(&mut source, &mut writer)
+            .with_context(|| format!("Could not add {} to MSI cabinet", file.source.display()))?;
+    }
+    let cursor = cabinet.finish().context("Could not finish MSI cabinet")?;
+    Ok(cursor.into_inner())
+}
+
 fn debian_control_file(
     package: &PackageReport,
     deb_package: &str,
@@ -1024,6 +1662,51 @@ fn rpm_version(version: Option<&str>) -> String {
     }
 }
 
+fn windows_artifact_version(version: Option<&str>) -> String {
+    let version = version.unwrap_or("0.1.0");
+    let sanitized = version
+        .chars()
+        .map(|char| {
+            if char.is_ascii_alphanumeric() || matches!(char, '.' | '-' | '_') {
+                char
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(['-', '.', '_'])
+        .to_string();
+
+    if sanitized.is_empty() {
+        "0.1.0".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn msi_product_version(version: Option<&str>) -> String {
+    let mut numbers = version
+        .unwrap_or("0.1.0")
+        .split(|char: char| !char.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u32>().ok())
+        .take(3)
+        .collect::<Vec<_>>();
+    while numbers.len() < 3 {
+        numbers.push(0);
+    }
+    if numbers.iter().all(|number| *number == 0) {
+        numbers = vec![0, 1, 0];
+    }
+
+    format!(
+        "{}.{}.{}",
+        numbers[0].min(255),
+        numbers[1].min(255),
+        numbers[2].min(65_535)
+    )
+}
+
 fn debian_arch(arch: &str) -> String {
     match arch {
         "x64" => "amd64".to_string(),
@@ -1041,6 +1724,99 @@ fn rpm_arch(arch: &str) -> String {
         "armv7l" => "armv7hl".to_string(),
         arch => arch.to_string(),
     }
+}
+
+fn windows_arch(arch: &str) -> String {
+    match arch {
+        "ia32" => "x86".to_string(),
+        arch => arch.to_string(),
+    }
+}
+
+fn msi_summary_arch(arch: &str) -> &'static str {
+    match arch {
+        "x64" => "x64",
+        "arm64" => "Arm64",
+        _ => "Intel",
+    }
+}
+
+fn msi_program_files_directory(arch: &str) -> &'static str {
+    match arch {
+        "x64" | "arm64" => "ProgramFiles64Folder",
+        _ => "ProgramFilesFolder",
+    }
+}
+
+fn msi_component_attributes(arch: &str) -> i32 {
+    match arch {
+        "x64" | "arm64" => 256,
+        _ => 0,
+    }
+}
+
+fn msi_filename(id: &str, long_name: &str) -> String {
+    if is_msi_short_name(long_name) {
+        return long_name.to_string();
+    }
+
+    let extension = Path::new(long_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            extension
+                .chars()
+                .filter(|char| char.is_ascii_alphanumeric())
+                .take(3)
+                .collect::<String>()
+        })
+        .filter(|extension| !extension.is_empty());
+    let stem = id
+        .chars()
+        .filter(|char| char.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>();
+    let short = match extension {
+        Some(extension) => format!("{stem}.{extension}"),
+        None => stem,
+    };
+    format!("{short}|{long_name}")
+}
+
+fn is_msi_short_name(name: &str) -> bool {
+    let Some(file_name) = Path::new(name).file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if file_name != name || file_name.is_empty() || file_name.contains(' ') {
+        return false;
+    }
+
+    let mut parts = file_name.split('.');
+    let stem = parts.next().unwrap_or_default();
+    let extension = parts.next();
+    if parts.next().is_some() || stem.is_empty() || stem.len() > 8 {
+        return false;
+    }
+    if extension.is_some_and(|extension| extension.is_empty() || extension.len() > 3) {
+        return false;
+    }
+
+    file_name
+        .chars()
+        .all(|char| char.is_ascii_alphanumeric() || matches!(char, '_' | '$' | '~' | '!' | '#'))
+}
+
+fn deterministic_guid(kind: &str, parts: &[&str]) -> Uuid {
+    let key = format!("electron-cli:{kind}:{}", parts.join(":"));
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes())
+}
+
+fn msi_guid(uuid: Uuid) -> String {
+    format!("{{{}}}", uuid.hyphenated()).to_ascii_uppercase()
+}
+
+fn s(value: impl Into<String>) -> Value {
+    Value::from(value.into())
 }
 
 fn single_line(value: &str) -> String {
@@ -1254,6 +2030,40 @@ mod tests {
                 .join("linux")
                 .join("x64")
                 .join("starter-app-0.1.0-1.x86_64.rpm")
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builds_make_report_for_msi_target() {
+        let root = unique_temp_dir("msi-plan");
+        write_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("win32".to_string()),
+            arch: Some("x64".to_string()),
+            target: crate::cli::MakeTarget::Msi,
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let report = build_report(&args).expect("report should build");
+
+        assert_eq!(report.target, "msi");
+        assert!(Path::new(report.artifact.as_str()).ends_with(
+            PathBuf::from("out")
+                .join("make")
+                .join("msi")
+                .join("win32")
+                .join("x64")
+                .join("starter-app-0.1.0-x64.msi")
         ));
 
         let _ = fs::remove_dir_all(root);
@@ -1488,6 +2298,76 @@ mod tests {
     }
 
     #[test]
+    fn writes_msi_archive_with_database_tables_and_embedded_cabinet() {
+        let root = unique_temp_dir("msi-archive");
+        write_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("win32".to_string()),
+            arch: Some("x64".to_string()),
+            target: crate::cli::MakeTarget::Msi,
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let report = build_report(&args).expect("report should build");
+        write_fake_windows_bundle(
+            Path::new(report.package.bundle_dir().as_str()),
+            "starter-app.exe",
+        );
+
+        write_msi_archive(&report.package, Path::new(report.artifact.as_str()))
+            .expect("msi should be written");
+
+        let mut installer = msi::open(report.artifact.as_str()).expect("msi should parse");
+        assert_eq!(installer.summary_info().arch(), Some("x64"));
+        assert!(installer.has_table("Property"));
+        assert!(installer.has_table("Directory"));
+        assert!(installer.has_table("File"));
+        assert!(installer.has_table("Media"));
+        assert!(installer.has_stream("app.cab"));
+
+        let properties = msi_rows(&mut installer, "Property");
+        assert!(properties.contains(&vec![
+            Value::from("ProductName"),
+            Value::from("starter-app")
+        ]));
+        assert!(properties.contains(&vec![Value::from("ProductVersion"), Value::from("0.1.0")]));
+
+        let files = msi_rows(&mut installer, "File");
+        assert!(files
+            .iter()
+            .any(|row| row[2] == Value::from("F0001.jso|package.json")));
+        assert!(files
+            .iter()
+            .any(|row| row[2] == Value::from("F0002.exe|starter-app.exe")));
+
+        let mut cabinet_bytes = Vec::new();
+        installer
+            .read_stream("app.cab")
+            .expect("cab stream should open")
+            .read_to_end(&mut cabinet_bytes)
+            .expect("cab stream should read");
+        let mut cabinet =
+            cab::Cabinet::new(Cursor::new(cabinet_bytes)).expect("cabinet should parse");
+        let mut package_json = String::new();
+        cabinet
+            .read_file("F0001")
+            .expect("package.json cabinet entry should open")
+            .read_to_string(&mut package_json)
+            .expect("package.json cabinet entry should read");
+        assert_eq!(package_json, "{}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn makes_deb_artifact_after_packaging_on_linux() {
         if !cfg!(target_os = "linux") {
             return;
@@ -1613,6 +2493,15 @@ mod tests {
             .expect("fake app package should be written");
     }
 
+    fn write_fake_windows_bundle(bundle_dir: &Path, executable_name: &str) {
+        fs::create_dir_all(bundle_dir.join("resources/app"))
+            .expect("fake Windows resources should be created");
+        fs::write(bundle_dir.join(executable_name), "fake exe")
+            .expect("fake Windows executable should be written");
+        fs::write(bundle_dir.join("resources/app/package.json"), "{}")
+            .expect("fake app package should be written");
+    }
+
     fn write_fake_electron_dist(root: &Path) {
         let dist = root.join("node_modules/electron/dist");
         if cfg!(target_os = "macos") {
@@ -1706,5 +2595,13 @@ mod tests {
                     .trim_start_matches("./")
                     == path
             })
+    }
+
+    fn msi_rows(installer: &mut msi::Package<File>, table: &str) -> Vec<Vec<Value>> {
+        installer
+            .select_rows(msi::Select::table(table))
+            .expect("msi rows should select")
+            .map(|row| (0..row.len()).map(|index| row[index].clone()).collect())
+            .collect()
     }
 }

@@ -36,12 +36,12 @@ The Rust-native flow currently owns:
 - `init --template minimal`: writes a local Electron starter without Electron Forge.
 - `start`: launches the installed Electron runtime directly.
 - `package`: copies the installed Electron runtime, app files, installed production dependency closure, app metadata, macOS icon, and extra resources into a local app bundle for the current platform and architecture.
-- `make`: runs `package` and writes a distributable under `out/make/<target>/<platform>/<arch>/`; ZIP works on all platforms, `--target dmg` writes a basic macOS disk image, and `--target deb` / `--target rpm` write Linux packages.
+- `make`: runs `package` and writes a distributable under `out/make/<target>/<platform>/<arch>/`; ZIP works on all platforms, `--target dmg` writes a basic macOS disk image, `--target deb` / `--target rpm` write Linux packages, and `--target msi` writes a basic Windows Installer package.
 - `publish`: runs `make` and publishes the distributable to a local directory with a manifest or to GitHub Releases.
 
 The GitHub publisher creates or reuses a release, uploads the selected make artifact, and can replace an existing asset with `--force`. It reads `GITHUB_TOKEN` or `GH_TOKEN` and can infer `OWNER/REPO` from `package.json` `repository`, or you can pass `--github-repo`.
 
-The DMG maker is currently a pure-Rust FAT32 image with the app bundle and an Applications entry. HFS+/APFS layout customization, Windows installers, Windows/Linux icon embedding, signing, and notarization are still TODO.
+The DMG maker is currently a pure-Rust FAT32 image with the app bundle and an Applications entry. The MSI maker writes a compressed embedded CAB, Windows Installer database tables, and a Start Menu shortcut when the packaged executable is present. HFS+/APFS DMG layout customization, installer UI customization, Windows/Linux icon embedding, signing, and notarization are still TODO.
 
 Package metadata can be configured in `package.json`:
 
@@ -97,6 +97,7 @@ cargo run -- make --dry-run
 cargo run -- make --target dmg --dry-run
 cargo run -- make --target deb --dry-run
 cargo run -- make --target rpm --dry-run
+cargo run -- make --target msi --platform win32 --dry-run
 cargo run -- publish --dry-run
 cargo run -- publish --publisher github --dry-run
 cargo run -- publish --publisher github --github-repo OWNER/REPO --github-tag v0.1.0

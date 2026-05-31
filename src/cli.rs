@@ -289,6 +289,7 @@ impl PackageManager {
 pub enum MakeTarget {
     Deb,
     Dmg,
+    Msi,
     Rpm,
     Zip,
 }
@@ -298,6 +299,7 @@ impl MakeTarget {
         match self {
             MakeTarget::Deb => "deb",
             MakeTarget::Dmg => "dmg",
+            MakeTarget::Msi => "msi",
             MakeTarget::Rpm => "rpm",
             MakeTarget::Zip => "zip",
         }
