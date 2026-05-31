@@ -4700,7 +4700,7 @@ mod tests {
             .icon
             .as_ref()
             .expect("Windows icon should be planned");
-        assert!(icon.from.as_str().ends_with("assets/starter.ico"));
+        assert!(icon.from.as_str().ends_with("starter.ico"));
         assert!(icon.to.as_str().ends_with(report.executable_name.as_str()));
         assert!(!report
             .copy_steps
