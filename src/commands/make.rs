@@ -1,13 +1,15 @@
 use std::{
     fs,
     fs::File,
-    io::{self, BufWriter, Write},
+    io::{self, BufWriter, Cursor, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
+use fatfs::{Dir as FatDir, FileSystem, FormatVolumeOptions, FsOptions, ReadWriteSeek};
 use flate2::{write::GzEncoder, Compression};
+use fscommon::BufStream;
 use rpm::{BuildConfig, CompressionType, FileOptions, PackageBuilder};
 use serde::Serialize;
 use tar::{Builder as TarBuilder, Header as TarHeader};
@@ -80,6 +82,12 @@ pub(crate) fn build_report(args: &MakeArgs) -> Result<MakeReport> {
             package.platform()
         ));
     }
+    if args.target == MakeTarget::Dmg && package.platform() != "darwin" {
+        warnings.push(format!(
+            "dmg maker only supports macOS packages; target platform is {}.",
+            package.platform()
+        ));
+    }
     if args.skip_package && !Path::new(package.bundle_dir().as_str()).exists() {
         warnings.push(format!(
             "Package output does not exist: {}.",
@@ -138,6 +146,7 @@ pub(crate) fn execute_make(report: &mut MakeReport, args: &MakeArgs) -> Result<(
             write_zip_archive(Path::new(report.package.bundle_dir().as_str()), artifact)?
         }
         MakeTarget::Deb => write_deb_archive(&report.package, artifact)?,
+        MakeTarget::Dmg => write_dmg_archive(&report.package, artifact)?,
         MakeTarget::Rpm => write_rpm_archive(&report.package, artifact)?,
     }
 
@@ -198,6 +207,12 @@ fn make_artifact_path(make_dir: &Path, package: &PackageReport, target: MakeTarg
             debian_version(package.project().version.as_deref()),
             debian_arch(package.arch())
         )),
+        MakeTarget::Dmg => make_dir.join(format!(
+            "{}-{}-{}.dmg",
+            package.artifact_stem(),
+            dmg_version(package.project().version.as_deref()),
+            package.arch()
+        )),
         MakeTarget::Rpm => make_dir.join(format!(
             "{}-{}-1.{}.rpm",
             rpm_package_name(&package.artifact_stem()),
@@ -230,6 +245,224 @@ fn write_zip_archive(source: &Path, artifact: &Path) -> Result<()> {
         .with_context(|| format!("Could not finish {}", artifact.display()))?;
 
     Ok(())
+}
+
+fn write_dmg_archive(package: &PackageReport, artifact: &Path) -> Result<()> {
+    if package.platform() != "darwin" {
+        bail!(
+            "DMG maker only supports macOS packages. Requested {}.",
+            package.platform()
+        );
+    }
+
+    let source = Path::new(package.bundle_dir().as_str());
+    if !source.exists() {
+        bail!("Package output does not exist: {}", source.display());
+    }
+    if source.extension().and_then(|extension| extension.to_str()) != Some("app") {
+        bail!(
+            "DMG maker expected a macOS .app bundle: {}",
+            source.display()
+        );
+    }
+
+    let parent = artifact
+        .parent()
+        .with_context(|| format!("Artifact path has no parent: {}", artifact.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("Could not create {}", parent.display()))?;
+
+    let volume_label = fat_volume_label(package.app_name());
+    let fat32 = create_dmg_fat32(source, &volume_label)?;
+    apple_dmg::DmgWriter::create(artifact)
+        .with_context(|| format!("Could not create {}", artifact.display()))?
+        .create_fat32(&fat32)
+        .with_context(|| format!("Could not write {}", artifact.display()))
+}
+
+const DMG_SECTOR_SIZE: u64 = 512;
+const DMG_MIN_BYTES: u64 = 64 * 1024 * 1024;
+const DMG_SECTOR_ALIGNMENT: u64 = 2048;
+
+fn create_dmg_fat32(app_bundle: &Path, volume_label: &[u8; 11]) -> Result<Vec<u8>> {
+    let total_sectors = dmg_total_sectors(app_bundle)?;
+    let mut fat32 = vec![0; total_sectors as usize * DMG_SECTOR_SIZE as usize];
+
+    {
+        let volume_options = FormatVolumeOptions::new()
+            .volume_label(*volume_label)
+            .bytes_per_sector(DMG_SECTOR_SIZE as u16)
+            .total_sectors(total_sectors);
+        let mut disk = BufStream::new(Cursor::new(&mut fat32));
+        fatfs::format_volume(&mut disk, volume_options)
+            .context("Could not format DMG FAT32 volume")?;
+        drop(disk);
+
+        let disk = BufStream::new(Cursor::new(&mut fat32));
+        let fs =
+            FileSystem::new(disk, FsOptions::new()).context("Could not open DMG FAT32 volume")?;
+        let root = fs.root_dir();
+        let app_name = utf8_file_name(app_bundle)?;
+        let app_dir = root
+            .create_dir(app_name)
+            .with_context(|| format!("Could not add {app_name} to DMG"))?;
+        add_directory_to_fat(app_bundle, &app_dir)
+            .with_context(|| format!("Could not add {} to DMG", app_bundle.display()))?;
+        write_fat_symlink(&root, "Applications", "/Applications")
+            .context("Could not add Applications link to DMG")?;
+    }
+
+    Ok(fat32)
+}
+
+fn dmg_total_sectors(app_bundle: &Path) -> Result<u32> {
+    let stats = directory_stats(app_bundle)?;
+    let cluster_slack_estimate =
+        stats.files.saturating_mul(16 * 1024) + stats.directories.saturating_mul(4096);
+    let payload_estimate = stats
+        .bytes
+        .saturating_add(cluster_slack_estimate)
+        .saturating_add(16 * 1024 * 1024);
+    let required_bytes = payload_estimate
+        .saturating_add(payload_estimate / 3)
+        .max(DMG_MIN_BYTES);
+    let sectors = required_bytes.div_ceil(DMG_SECTOR_SIZE);
+    let aligned_sectors = sectors.div_ceil(DMG_SECTOR_ALIGNMENT) * DMG_SECTOR_ALIGNMENT;
+    u32::try_from(aligned_sectors).context("DMG contents are too large for a FAT32 image")
+}
+
+#[derive(Default)]
+struct DirectoryStats {
+    bytes: u64,
+    files: u64,
+    directories: u64,
+}
+
+fn directory_stats(path: &Path) -> Result<DirectoryStats> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("Could not stat {}", path.display()))?;
+    if metadata.is_file() {
+        return Ok(DirectoryStats {
+            bytes: metadata.len(),
+            files: 1,
+            directories: 0,
+        });
+    }
+    if metadata.file_type().is_symlink() {
+        return Ok(DirectoryStats {
+            bytes: read_link_lossy(path)?.len() as u64,
+            files: 1,
+            directories: 0,
+        });
+    }
+    if !metadata.is_dir() {
+        return Ok(DirectoryStats::default());
+    }
+
+    let mut stats = DirectoryStats {
+        bytes: 0,
+        files: 0,
+        directories: 1,
+    };
+    for entry in fs::read_dir(path).with_context(|| format!("Could not read {}", path.display()))? {
+        let entry = entry?;
+        let child = directory_stats(&entry.path())?;
+        stats.bytes = stats.bytes.saturating_add(child.bytes);
+        stats.files = stats.files.saturating_add(child.files);
+        stats.directories = stats.directories.saturating_add(child.directories);
+    }
+    Ok(stats)
+}
+
+fn add_directory_to_fat<T: ReadWriteSeek>(
+    source: &Path,
+    destination: &FatDir<'_, T>,
+) -> Result<()> {
+    let mut entries = fs::read_dir(source)
+        .with_context(|| format!("Could not read {}", source.display()))?
+        .collect::<Result<Vec<_>, io::Error>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let source_path = entry.path();
+        let file_name = utf8_file_name(&source_path)?;
+        let metadata = fs::symlink_metadata(&source_path)
+            .with_context(|| format!("Could not stat {}", source_path.display()))?;
+
+        if metadata.is_dir() {
+            let child = destination
+                .create_dir(file_name)
+                .with_context(|| format!("Could not create DMG directory {file_name}"))?;
+            add_directory_to_fat(&source_path, &child)?;
+        } else if metadata.file_type().is_symlink() {
+            let target = read_link_lossy(&source_path)?;
+            write_fat_symlink(destination, file_name, &target)?;
+        } else if metadata.is_file() {
+            let mut source_file = File::open(&source_path)
+                .with_context(|| format!("Could not open {}", source_path.display()))?;
+            let mut destination_file = destination
+                .create_file(file_name)
+                .with_context(|| format!("Could not create DMG file {file_name}"))?;
+            io::copy(&mut source_file, &mut destination_file)
+                .with_context(|| format!("Could not write DMG file {file_name}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_fat_symlink<T: ReadWriteSeek>(
+    directory: &FatDir<'_, T>,
+    name: &str,
+    target: &str,
+) -> Result<()> {
+    let bytes = fat_symlink_bytes(target)?;
+    let mut file = directory
+        .create_file(name)
+        .with_context(|| format!("Could not create DMG symlink {name}"))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("Could not write DMG symlink {name}"))
+}
+
+fn fat_symlink_bytes(target: &str) -> Result<Vec<u8>> {
+    let mut bytes = format!(
+        "XSym\n{:04}\n{:x}\n{}\n",
+        target.len(),
+        md5::compute(target.as_bytes()),
+        target
+    )
+    .into_bytes();
+    anyhow::ensure!(bytes.len() <= 1067, "Symlink target is too long: {target}");
+    bytes.resize(1067, b' ');
+    Ok(bytes)
+}
+
+fn fat_volume_label(name: &str) -> [u8; 11] {
+    let mut label = [b' '; 11];
+    let sanitized = name
+        .to_ascii_uppercase()
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .take(11)
+        .collect::<Vec<_>>();
+    if sanitized.is_empty() {
+        label[..3].copy_from_slice(b"APP");
+    } else {
+        label[..sanitized.len()].copy_from_slice(&sanitized);
+    }
+    label
+}
+
+fn read_link_lossy(path: &Path) -> Result<String> {
+    Ok(fs::read_link(path)
+        .with_context(|| format!("Could not read link {}", path.display()))?
+        .to_string_lossy()
+        .to_string())
+}
+
+fn utf8_file_name(path: &Path) -> Result<&str> {
+    path.file_name()
+        .and_then(|file_name| file_name.to_str())
+        .with_context(|| format!("Path has no UTF-8 file name: {}", path.display()))
 }
 
 fn add_path_to_zip(
@@ -747,6 +980,28 @@ fn debian_version(version: Option<&str>) -> String {
     }
 }
 
+fn dmg_version(version: Option<&str>) -> String {
+    let version = version.unwrap_or("0.1.0");
+    let sanitized = version
+        .chars()
+        .map(|char| {
+            if char.is_ascii_alphanumeric() || matches!(char, '.' | '-' | '_') {
+                char
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(['-', '.', '_'])
+        .to_string();
+
+    if sanitized.is_empty() {
+        "0.1.0".to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn rpm_version(version: Option<&str>) -> String {
     let version = version.unwrap_or("0.1.0");
     let sanitized = version
@@ -937,6 +1192,40 @@ mod tests {
     }
 
     #[test]
+    fn builds_make_report_for_dmg_target() {
+        let root = unique_temp_dir("dmg-plan");
+        write_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("darwin".to_string()),
+            arch: Some("arm64".to_string()),
+            target: crate::cli::MakeTarget::Dmg,
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let report = build_report(&args).expect("report should build");
+
+        assert_eq!(report.target, "dmg");
+        assert!(Path::new(report.artifact.as_str()).ends_with(
+            PathBuf::from("out")
+                .join("make")
+                .join("dmg")
+                .join("darwin")
+                .join("arm64")
+                .join("starter-app-0.1.0-arm64.dmg")
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn builds_make_report_for_rpm_target() {
         let root = unique_temp_dir("rpm-plan");
         write_package_json(&root);
@@ -1072,6 +1361,74 @@ mod tests {
     }
 
     #[test]
+    fn writes_dmg_archive_with_app_bundle_and_applications_entry() {
+        let root = unique_temp_dir("dmg-archive");
+        write_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("darwin".to_string()),
+            arch: Some("arm64".to_string()),
+            target: crate::cli::MakeTarget::Dmg,
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let report = build_report(&args).expect("report should build");
+        write_fake_macos_bundle(
+            Path::new(report.package.bundle_dir().as_str()),
+            "starter-app",
+        );
+
+        write_dmg_archive(&report.package, Path::new(report.artifact.as_str()))
+            .expect("dmg should be written");
+
+        let mut dmg = apple_dmg::DmgReader::open(Path::new(report.artifact.as_str()))
+            .expect("dmg should parse");
+        assert_eq!(dmg.plist().partitions().len(), 2);
+        let fat32 = dmg.partition_data(1).expect("fat32 partition should read");
+        let fs = fatfs::FileSystem::new(Cursor::new(fat32), fatfs::FsOptions::new())
+            .expect("fat32 should mount");
+        let root_dir = fs.root_dir();
+        let entries = root_dir
+            .iter()
+            .map(|entry| entry.expect("fat entry should read").file_name())
+            .collect::<Vec<_>>();
+        assert!(entries.contains(&"starter-app.app".to_string()));
+        assert!(entries.contains(&"Applications".to_string()));
+
+        let app_dir = root_dir
+            .open_dir("starter-app.app")
+            .expect("app bundle should exist");
+        let contents = app_dir.open_dir("Contents").expect("Contents should exist");
+        let resources = contents
+            .open_dir("Resources")
+            .expect("Resources should exist");
+        let app_resources = resources
+            .open_dir("app")
+            .expect("app resources should exist");
+        app_resources
+            .open_file("package.json")
+            .expect("app package should exist");
+
+        let mut applications = String::new();
+        root_dir
+            .open_file("Applications")
+            .expect("Applications entry should exist")
+            .read_to_string(&mut applications)
+            .expect("Applications entry should read");
+        assert!(applications.starts_with("XSym\n0013\n"));
+        assert!(applications.contains("/Applications"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn writes_rpm_archive_with_metadata_and_payload_entries() {
         let root = unique_temp_dir("rpm-archive");
         write_package_json(&root);
@@ -1163,6 +1520,38 @@ mod tests {
     }
 
     #[test]
+    fn makes_dmg_artifact_after_packaging_on_macos() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+
+        let root = unique_temp_dir("dmg-execute");
+        write_package_json(&root);
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            target: crate::cli::MakeTarget::Dmg,
+            skip_package: false,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let mut report = build_report(&args).expect("report should build");
+
+        execute_make(&mut report, &args).expect("make should succeed");
+
+        assert!(Path::new(report.artifact.as_str()).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn makes_rpm_artifact_after_packaging_on_linux() {
         if !cfg!(target_os = "linux") {
             return;
@@ -1206,6 +1595,22 @@ mod tests {
         fs::create_dir_all(root.join("src")).expect("src should be created");
         fs::write(root.join("src/main.js"), "console.log('hello');")
             .expect("main file should be written");
+    }
+
+    fn write_fake_macos_bundle(bundle_dir: &Path, executable_name: &str) {
+        fs::create_dir_all(bundle_dir.join("Contents/MacOS"))
+            .expect("fake macOS executable directory should be created");
+        fs::create_dir_all(bundle_dir.join("Contents/Resources/app"))
+            .expect("fake macOS resources should be created");
+        fs::write(
+            bundle_dir.join("Contents/MacOS").join(executable_name),
+            "#!/bin/sh\n",
+        )
+        .expect("fake macOS executable should be written");
+        fs::write(bundle_dir.join("Contents/Info.plist"), "<plist/>")
+            .expect("fake macOS plist should be written");
+        fs::write(bundle_dir.join("Contents/Resources/app/package.json"), "{}")
+            .expect("fake app package should be written");
     }
 
     fn write_fake_electron_dist(root: &Path) {

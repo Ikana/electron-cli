@@ -42,10 +42,10 @@ The Rust-native flow currently owns:
 - `init --template minimal`: writes a local Electron starter without Electron Forge.
 - `start`: launches the installed Electron runtime directly.
 - `package`: copies the installed Electron runtime, app files, installed production dependency closure, app metadata, macOS icon, and extra resources into a local app bundle for the current platform and architecture.
-- `make`: runs `package` and writes a distributable under `out/make/<target>/<platform>/<arch>/`; ZIP works on all platforms, while `--target deb` and `--target rpm` write Linux packages.
+- `make`: runs `package` and writes a distributable under `out/make/<target>/<platform>/<arch>/`; ZIP works on all platforms, `--target dmg` writes a basic macOS disk image, and `--target deb` / `--target rpm` write Linux packages.
 - `publish`: runs `make` and publishes the distributable to a local directory with a manifest.
 
-Remote publishers such as GitHub Releases are not implemented yet. DMG, Windows installers, Windows/Linux icon embedding, signing, and notarization are also still TODO.
+Remote publishers such as GitHub Releases are not implemented yet. The DMG maker is currently a pure-Rust FAT32 image with the app bundle and an Applications entry; HFS+/APFS layout customization, Windows installers, Windows/Linux icon embedding, signing, and notarization are still TODO.
 
 Package metadata can be configured in `package.json`:
 
@@ -98,6 +98,7 @@ cargo run -- init my-app
 cargo run -- start --dry-run
 cargo run -- package --dry-run
 cargo run -- make --dry-run
+cargo run -- make --target dmg --dry-run
 cargo run -- make --target deb --dry-run
 cargo run -- make --target rpm --dry-run
 cargo run -- publish --dry-run

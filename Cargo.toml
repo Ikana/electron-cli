@@ -1,6 +1,6 @@
 [package]
 name = "electron-cli"
-version = "0.3.0-alpha.9"
+version = "0.3.0-alpha.10"
 edition = "2021"
 description = "Experimental Rust CLI for Electron project diagnostics and workflow automation"
 license = "MIT"
@@ -8,9 +8,13 @@ repository = "https://github.com/Ikana/electron-cli"
 
 [dependencies]
 anyhow = "1.0"
+apple-dmg = "0.5"
 camino = { version = "1.1", features = ["serde1"] }
 clap = { version = "4.6", features = ["derive"] }
+fatfs = "0.3"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+fscommon = "0.1"
+md5 = "0.7"
 plist = "1"
 rpm = { version = "0.24", default-features = false, features = ["payload", "gzip-compression"] }
 serde = { version = "1.0", features = ["derive"] }
