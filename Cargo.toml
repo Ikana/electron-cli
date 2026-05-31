@@ -29,3 +29,6 @@ tar = "0.4"
 ureq = { version = "3.3", features = ["json"] }
 uuid = { version = "1", features = ["v5"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[dev-dependencies]
+asar = "0.3"

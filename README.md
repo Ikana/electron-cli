@@ -35,7 +35,7 @@ The Rust-native flow currently owns:
 
 - `init --template minimal`: writes a local Electron starter without Electron Forge.
 - `start`: launches the installed Electron runtime directly.
-- `package`: copies the installed Electron runtime, app files, installed production dependency closure, app metadata, macOS icon, and extra resources into a local app bundle for the current platform and architecture; it reads package metadata and ignore rules from `package.json`, JSON-shaped Forge config, and static Forge config files, and can apply experimental Rust-native ad-hoc macOS bundle signatures.
+- `package`: copies the installed Electron runtime, app files, installed production dependency closure, app metadata, macOS icon, and extra resources into a local app bundle for the current platform and architecture; it reads package metadata, ignore rules, and ASAR settings from `package.json`, JSON-shaped Forge config, and static Forge config files, and can apply experimental Rust-native ad-hoc macOS bundle signatures.
 - `make`: runs `package` and writes distributables under `out/make/<target>/<platform>/<arch>/`; it reads JSON-shaped `config.forge.makers` / `electronCli.makers` arrays and static Forge config files when `--target` is omitted, and `--target` still forces one maker. ZIP works on all platforms, `--target dmg` writes a basic macOS disk image, `--target deb` / `--target rpm` write Linux packages, and `--target msi` writes a basic Windows Installer package.
 - `publish`: runs `make` and publishes distributables to a local directory with a manifest or to GitHub Releases; it reads JSON-shaped `config.forge.publishers` / `electronCli.publishers` arrays and static Forge config files when `--publisher` is omitted, and `--publisher` still forces one publisher.
 
@@ -43,7 +43,7 @@ The GitHub publisher creates or reuses a release, uploads selected make artifact
 
 The package command recognizes macOS `packagerConfig.osxSign` and `packagerConfig.osxNotarize` options and reports the signing/notarization plan without serializing credential values. When `osxSign` is enabled on macOS and no certificate identity is configured, or the identity is `"-"`, `package` writes an experimental Rust-native ad-hoc signature for the generated `.app` bundle. When `osxSign.p12File` points at a `.p12`/PFX certificate export, `package` can sign the bundle with that certificate and can request a CMS timestamp token for notarization-compatible signatures. With p12 signing and App Store Connect API key auth, `package` can submit to Apple notarization, wait for the result, and staple the ticket natively in Rust. macOS keychain identity lookup and keychain/Apple ID notarization auth are not implemented yet.
 
-The DMG maker is currently a pure-Rust FAT32 image with the app bundle and an Applications entry. The MSI maker writes a compressed embedded CAB, Windows Installer database tables, and a Start Menu shortcut when the packaged executable is present. HFS+/APFS DMG layout customization, installer UI customization, Windows/Linux icon embedding, macOS keychain signing, and additional notarization auth modes are still TODO.
+The DMG maker is currently a pure-Rust FAT32 image with the app bundle and an Applications entry. The MSI maker writes a compressed embedded CAB, Windows Installer database tables, and a Start Menu shortcut when the packaged executable is present. HFS+/APFS DMG layout customization, ASAR unpack options, installer UI customization, Windows/Linux icon embedding, macOS keychain signing, and additional notarization auth modes are still TODO.
 
 Package metadata can be configured in `package.json`:
 
@@ -56,6 +56,7 @@ Package metadata can be configured in `package.json`:
       "appCategoryType": "public.app-category.developer-tools",
       "icon": "assets/icon",
       "extraResource": "assets/config.json",
+      "asar": true,
       "ignore": [
         "^/coverage(?:/|$)",
         "^/dist-dev(?:/|$)",
@@ -109,7 +110,7 @@ Package metadata can be configured in `package.json`:
 
 Use `p12PasswordEnv`, `p12PasswordFile`, or `p12Password` for the `.p12` password; password values are not serialized in package reports. Set `osxSign.timestamp` to a timestamp server URL, `true` for Apple's default `http://timestamp.apple.com/ts01`, or `"none"` / `false` to disable timestamping. When `osxNotarize` is enabled with p12 signing, `electron-cli` automatically enables notarization-compatible signing and uses Apple's timestamp server unless timestamping is disabled explicitly. Rust-native notarization execution currently requires `appleApiKey`, `appleApiKeyId`, and `appleApiIssuer`; `appleApiKey` may point at the `.p8` file from App Store Connect or a unified API key JSON file. It waits up to `maxWaitSeconds` or 600 seconds by default and staples by default. Set `staple: false` to skip stapling, or set both `staple: false` and `wait: false` to submit without waiting. Set `identity` to a Developer ID certificate name when you want the plan to reflect Forge-style keychain release signing, but this project will report it as not executable until Rust-native keychain lookup exists. Use `identity: "-"` or omit `identity` for the current ad-hoc signing path.
 
-The package command also reads JSON-shaped `config.forge.packagerConfig` and `electronPackagerConfig` entries for the same fields. `packagerConfig.ignore` accepts regex strings or JavaScript-style regex literal strings such as `"/^\\/coverage/i"`; patterns are matched against project-relative paths with and without a leading slash, plus the absolute source path. The ignore filter applies to copied app files and the copied production dependency closure, but not to the Electron runtime, icons, or explicit `extraResource` entries. The make command maps JSON-shaped Forge maker names to the Rust-native targets it supports: zip, dmg, deb, rpm, and wix/msi. The publish command maps JSON-shaped publisher names to local and GitHub.
+The package command also reads JSON-shaped `config.forge.packagerConfig` and `electronPackagerConfig` entries for the same fields. `packagerConfig.asar: true` writes `resources/app.asar` natively in Rust and removes the loose `resources/app` staging directory before signing or making artifacts. ASAR option objects are accepted as enabled, but options such as `unpack`, `unpackDir`, and `ordering` are reported as not implemented yet. `packagerConfig.ignore` accepts regex strings or JavaScript-style regex literal strings such as `"/^\\/coverage/i"`; patterns are matched against project-relative paths with and without a leading slash, plus the absolute source path. The ignore filter applies to copied app files and the copied production dependency closure, but not to the Electron runtime, icons, or explicit `extraResource` entries. The make command maps JSON-shaped Forge maker names to the Rust-native targets it supports: zip, dmg, deb, rpm, and wix/msi. The publish command maps JSON-shaped publisher names to local and GitHub.
 
 Static `forge.config.js`, `forge.config.cjs`, `forge.config.mjs`, and `forge.config.ts` files are parsed in Rust when they export an object literal directly or via a local `const`/`let`/`var` identifier. Dynamic JavaScript config that calls functions, reads environment state, or computes the config at runtime is not evaluated.
 
@@ -175,7 +176,7 @@ The inspection and planning commands support `--json` so agents and scripts can 
 `plan` is designed around that workflow: it recommends stable commands and reports missing project conventions as structured data.
 `init --dry-run --json` shows whether the CLI will write native template files or delegate to `create-electron-app`.
 `start --dry-run --json` shows the Electron executable that will be launched.
-`package --dry-run --json` shows the runtime, app file, metadata, icon, and extra-resource copy plan.
+`package --dry-run --json` shows the runtime, app file, metadata, ASAR, icon, and extra-resource copy plan.
 `make --dry-run --json` shows the package prerequisite and selected maker artifact path.
 `publish --dry-run --json` shows the make prerequisite plus either the local destination/manifest path or the GitHub release/upload plan. When multiple configured makers or publishers apply, the JSON output contains a `publishes` array.
 

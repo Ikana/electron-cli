@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
+    fs::File,
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
 };
 
@@ -29,6 +31,7 @@ pub(crate) struct PackageReport {
     app_name: String,
     executable_name: String,
     metadata: PackageMetadata,
+    asar: AsarPlan,
     signing: PackageSigningPlan,
     platform: String,
     arch: String,
@@ -66,6 +69,13 @@ struct PackageMetadata {
 struct IconResource {
     from: Utf8PathBuf,
     to: Utf8PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AsarPlan {
+    configured: bool,
+    enabled: bool,
+    archive: Option<Utf8PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -168,9 +178,18 @@ struct PackagerConfig {
     icon: Vec<String>,
     extra_resource: Vec<String>,
     ignore: Vec<String>,
+    asar: AsarConfig,
     darwin_dark_mode_support: bool,
     osx_sign: MacosSignConfig,
     osx_notarize: MacosNotarizeConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AsarConfig {
+    configured: bool,
+    enabled: bool,
+    invalid_type: bool,
+    unsupported_options: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -266,6 +285,7 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         &app_resources_dir,
         &platform,
     )?;
+    let (asar, asar_warnings) = package_asar(&app_resources_dir, &package_config)?;
     let (signing, signing_warnings) = package_signing(root, &package_config, &platform)?;
 
     let mut warnings = package_config.warnings.clone();
@@ -304,6 +324,7 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
 
     warnings.extend(runtime_dependency_warnings(root, &snapshot));
     warnings.extend(metadata_warnings);
+    warnings.extend(asar_warnings);
     warnings.extend(signing_warnings);
     let _ = compile_ignore_rules(&package_config.packager.ignore, Some(&mut warnings));
 
@@ -336,6 +357,7 @@ pub(crate) fn build_report(snapshot: ProjectSnapshot, args: &PackageArgs) -> Res
         app_name,
         executable_name,
         metadata,
+        asar,
         signing,
         platform,
         arch,
@@ -441,6 +463,7 @@ pub(crate) fn execute_package(report: &PackageReport, force: bool) -> Result<()>
         &report.project,
         &ignore_rules,
     )?;
+    execute_asar_packaging(report)?;
     execute_macos_signing(report)?;
     execute_macos_notarization(report)?;
 
@@ -810,6 +833,18 @@ fn print_report(report: &PackageReport, json: bool) -> Result<()> {
         }
     }
 
+    if report.asar.configured || report.asar.enabled {
+        println!();
+        println!("ASAR");
+        println!(
+            "  enabled: {}",
+            if report.asar.enabled { "yes" } else { "no" }
+        );
+        if let Some(archive) = &report.asar.archive {
+            println!("  archive: {archive}");
+        }
+    }
+
     println!();
     println!("Output");
     println!("  {}", report.bundle_dir);
@@ -889,12 +924,40 @@ fn parse_packager_config(value: &JsonValue) -> PackagerConfig {
         icon: string_list(value.get("icon")),
         extra_resource: string_list(value.get("extraResource")),
         ignore: string_list(value.get("ignore")),
+        asar: parse_asar_config(value.get("asar")),
         darwin_dark_mode_support: value
             .get("darwinDarkModeSupport")
             .and_then(JsonValue::as_bool)
             .unwrap_or(false),
         osx_sign: parse_macos_sign_config(value.get("osxSign")),
         osx_notarize: parse_macos_notarize_config(value.get("osxNotarize")),
+    }
+}
+
+fn parse_asar_config(value: Option<&JsonValue>) -> AsarConfig {
+    match value {
+        None => AsarConfig::default(),
+        Some(JsonValue::Bool(false)) => AsarConfig {
+            configured: true,
+            enabled: false,
+            ..AsarConfig::default()
+        },
+        Some(JsonValue::Bool(true)) => AsarConfig {
+            configured: true,
+            enabled: true,
+            ..AsarConfig::default()
+        },
+        Some(JsonValue::Object(object)) => AsarConfig {
+            configured: true,
+            enabled: true,
+            invalid_type: false,
+            unsupported_options: object.keys().cloned().collect(),
+        },
+        Some(_) => AsarConfig {
+            configured: true,
+            invalid_type: true,
+            ..AsarConfig::default()
+        },
     }
 }
 
@@ -1198,6 +1261,37 @@ fn package_metadata(
             icon,
             extra_resources,
             darwin_dark_mode_support: config.packager.darwin_dark_mode_support,
+        },
+        warnings,
+    ))
+}
+
+fn package_asar(
+    app_resources_dir: &Path,
+    config: &PackageJsonConfig,
+) -> Result<(AsarPlan, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let config = &config.packager.asar;
+
+    if config.invalid_type {
+        warnings.push("packagerConfig.asar must be false, true, or an object.".to_string());
+    }
+
+    if config.enabled && !config.unsupported_options.is_empty() {
+        warnings.push(format!(
+            "packagerConfig.asar options are recognized but not implemented yet and will be ignored: {}.",
+            config.unsupported_options.join(", ")
+        ));
+    }
+
+    Ok((
+        AsarPlan {
+            configured: config.configured,
+            enabled: config.enabled,
+            archive: config
+                .enabled
+                .then(|| utf8_path(app_resources_dir.join("app.asar")))
+                .transpose()?,
         },
         warnings,
     ))
@@ -1849,6 +1943,274 @@ fn copy_runtime_dependencies(
     Ok(())
 }
 
+#[derive(Serialize)]
+#[serde(untagged)]
+enum AsarHeaderNode {
+    File(AsarFileHeader),
+    Directory {
+        files: BTreeMap<String, AsarHeaderNode>,
+    },
+    Link {
+        link: String,
+    },
+}
+
+#[derive(Serialize)]
+struct AsarFileHeader {
+    size: u64,
+    offset: String,
+    #[serde(skip_serializing_if = "is_false")]
+    executable: bool,
+}
+
+enum AsarEntryKind {
+    Directory,
+    File { size: u64, executable: bool },
+    Link { target: String },
+}
+
+struct AsarEntry {
+    source: PathBuf,
+    relative: PathBuf,
+    kind: AsarEntryKind,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn execute_asar_packaging(report: &PackageReport) -> Result<()> {
+    if !report.asar.enabled {
+        return Ok(());
+    }
+
+    let app_dir = Path::new(report.app_resources_dir.as_str()).join("app");
+    let archive = report
+        .asar
+        .archive
+        .as_ref()
+        .context("ASAR packaging is enabled without an archive path")?;
+    let archive = Path::new(archive.as_str());
+
+    if !app_dir.exists() {
+        bail!(
+            "ASAR packaging expected app staging directory: {}",
+            app_dir.display()
+        );
+    }
+
+    let entries = collect_asar_entries(&app_dir, &app_dir)
+        .with_context(|| format!("Could not collect ASAR entries from {}", app_dir.display()))?;
+    write_asar_archive(&entries, archive)
+        .with_context(|| format!("Could not write ASAR archive {}", archive.display()))?;
+
+    fs::remove_dir_all(&app_dir).with_context(|| {
+        format!(
+            "Could not remove ASAR staging directory {}",
+            app_dir.display()
+        )
+    })
+}
+
+fn collect_asar_entries(source: &Path, base: &Path) -> Result<Vec<AsarEntry>> {
+    let mut entries = Vec::new();
+    collect_asar_entries_into(source, base, &mut entries)?;
+    Ok(entries)
+}
+
+fn collect_asar_entries_into(
+    source: &Path,
+    base: &Path,
+    entries: &mut Vec<AsarEntry>,
+) -> Result<()> {
+    let mut children = fs::read_dir(source)
+        .with_context(|| format!("Could not read {}", source.display()))?
+        .collect::<Result<Vec<_>, io::Error>>()?;
+    children.sort_by_key(|entry| entry.path());
+
+    for child in children {
+        let path = child.path();
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("Could not stat {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&path)
+                .with_context(|| format!("Could not read symlink {}", path.display()))?;
+            entries.push(AsarEntry {
+                source: path.clone(),
+                relative: asar_relative_path(&path, base)?,
+                kind: AsarEntryKind::Link {
+                    target: path_to_forward_slashes(&target),
+                },
+            });
+        } else if metadata.is_dir() {
+            entries.push(AsarEntry {
+                source: path.clone(),
+                relative: asar_relative_path(&path, base)?,
+                kind: AsarEntryKind::Directory,
+            });
+            collect_asar_entries_into(&path, base, entries)?;
+        } else if metadata.is_file() {
+            entries.push(AsarEntry {
+                source: path.clone(),
+                relative: asar_relative_path(&path, base)?,
+                kind: AsarEntryKind::File {
+                    size: metadata.len(),
+                    executable: is_executable(&metadata),
+                },
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn write_asar_archive(entries: &[AsarEntry], archive: &Path) -> Result<()> {
+    let mut header = AsarHeaderNode::Directory {
+        files: BTreeMap::new(),
+    };
+    let mut offset = 0_u64;
+
+    for entry in entries {
+        match &entry.kind {
+            AsarEntryKind::Directory => {
+                insert_asar_header_entry(
+                    &mut header,
+                    &entry.relative,
+                    AsarHeaderNode::Directory {
+                        files: BTreeMap::new(),
+                    },
+                )?;
+            }
+            AsarEntryKind::File { size, executable } => {
+                insert_asar_header_entry(
+                    &mut header,
+                    &entry.relative,
+                    AsarHeaderNode::File(AsarFileHeader {
+                        size: *size,
+                        offset: offset.to_string(),
+                        executable: *executable,
+                    }),
+                )?;
+                offset = offset.saturating_add(*size);
+            }
+            AsarEntryKind::Link { target } => {
+                insert_asar_header_entry(
+                    &mut header,
+                    &entry.relative,
+                    AsarHeaderNode::Link {
+                        link: target.clone(),
+                    },
+                )?;
+            }
+        }
+    }
+
+    let mut json = serde_json::to_vec(&header).context("Could not serialize ASAR header")?;
+    let json_size = u32::try_from(json.len()).context("ASAR header is too large")?;
+    let aligned_json_size = json_size + (4 - (json_size % 4)) % 4;
+    json.resize(aligned_json_size as usize, 0);
+
+    let file = File::create(archive)
+        .with_context(|| format!("Could not create ASAR archive {}", archive.display()))?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(&4_u32.to_le_bytes())?;
+    writer.write_all(&(aligned_json_size + 8).to_le_bytes())?;
+    writer.write_all(&(aligned_json_size + 4).to_le_bytes())?;
+    writer.write_all(&json_size.to_le_bytes())?;
+    writer.write_all(&json)?;
+
+    for entry in entries {
+        if matches!(entry.kind, AsarEntryKind::File { .. }) {
+            let mut input = File::open(&entry.source)
+                .with_context(|| format!("Could not open {}", entry.source.display()))?;
+            io::copy(&mut input, &mut writer)
+                .with_context(|| format!("Could not write {} to ASAR", entry.source.display()))?;
+        }
+    }
+
+    writer.flush().context("Could not flush ASAR archive")
+}
+
+fn insert_asar_header_entry(
+    header: &mut AsarHeaderNode,
+    relative: &Path,
+    leaf: AsarHeaderNode,
+) -> Result<()> {
+    let components = asar_path_components(relative)?;
+    insert_asar_header_components(header, &components, leaf)
+}
+
+fn insert_asar_header_components(
+    header: &mut AsarHeaderNode,
+    components: &[String],
+    leaf: AsarHeaderNode,
+) -> Result<()> {
+    let AsarHeaderNode::Directory { files } = header else {
+        bail!("ASAR header path conflicts with an existing file");
+    };
+    let Some((name, rest)) = components.split_first() else {
+        bail!("ASAR entry path is empty");
+    };
+
+    if rest.is_empty() {
+        files.insert(name.clone(), leaf);
+    } else {
+        let child = files
+            .entry(name.clone())
+            .or_insert_with(|| AsarHeaderNode::Directory {
+                files: BTreeMap::new(),
+            });
+        insert_asar_header_components(child, rest, leaf)?;
+    }
+
+    Ok(())
+}
+
+fn asar_path_components(path: &Path) -> Result<Vec<String>> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(value) => {
+                components.push(value.to_string_lossy().to_string());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::Prefix(_)
+            | std::path::Component::RootDir => {
+                bail!("ASAR entry path must be relative: {}", path.display());
+            }
+        }
+    }
+    if components.is_empty() {
+        bail!("ASAR entry path is empty");
+    }
+    Ok(components)
+}
+
+fn asar_relative_path(path: &Path, base: &Path) -> Result<PathBuf> {
+    path.strip_prefix(base)
+        .with_context(|| {
+            format!(
+                "Could not make {} relative to {} for ASAR",
+                path.display(),
+                base.display()
+            )
+        })
+        .map(Path::to_path_buf)
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
 fn apply_package_metadata(report: &PackageReport) -> Result<()> {
     if report.platform == "darwin" {
         apply_macos_metadata(report)?;
@@ -2334,6 +2696,9 @@ impl PackagerConfig {
         if !other.ignore.is_empty() {
             self.ignore = other.ignore;
         }
+        if other.asar.configured {
+            self.asar = other.asar;
+        }
         self.darwin_dark_mode_support =
             other.darwin_dark_mode_support || self.darwin_dark_mode_support;
         if other.osx_sign.configured {
@@ -2657,6 +3022,101 @@ mod tests {
             .iter()
             .any(|warning| warning
                 .contains("Configured packager ignore pattern is not a valid regex")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn packages_app_into_asar_archive() {
+        let root = unique_temp_dir("asar-package");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"starter-app","version":"0.1.0","main":"src/main.js","dependencies":{"dep-a":"1.0.0"},"devDependencies":{"electron":"30.0.0"},"electronCli":{"packagerConfig":{"asar":true}}}"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+        write_dependency_package(&root, "dep-a", r#"{"name":"dep-a","version":"1.0.0"}"#);
+        fs::create_dir_all(root.join("node_modules/dep-a/empty-cache"))
+            .expect("empty dependency directory should be written");
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: false,
+            json: false,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.asar.configured);
+        assert!(report.asar.enabled);
+        assert!(report.asar.archive.is_some());
+        assert!(report.warnings.is_empty());
+
+        execute_package(&report, false).expect("package should succeed");
+
+        let app_dir = Path::new(report.app_resources_dir.as_str()).join("app");
+        let app_asar = Path::new(report.app_resources_dir.as_str()).join("app.asar");
+        assert!(!app_dir.exists());
+        assert!(app_asar.exists());
+
+        let archive = fs::read(&app_asar).expect("ASAR archive should read");
+        let reader = asar::AsarReader::new(&archive, None).expect("ASAR archive should parse");
+        assert!(reader.read(Path::new("package.json")).is_some());
+        assert!(reader.read(Path::new("src/main.js")).is_some());
+        assert!(reader
+            .read(Path::new("node_modules/dep-a/package.json"))
+            .is_some());
+        assert!(reader
+            .read(Path::new("node_modules/dep-a/index.js"))
+            .is_some());
+        let dep_contents = reader
+            .read_dir(Path::new("node_modules/dep-a"))
+            .expect("dep-a directory should be readable");
+        assert!(dep_contents
+            .iter()
+            .any(|path| path.as_path() == Path::new("node_modules/dep-a/empty-cache")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn warns_for_unsupported_asar_options_but_plans_archive() {
+        let root = unique_temp_dir("asar-options");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"starter-app","version":"0.1.0","main":"src/main.js","devDependencies":{"electron":"30.0.0"},"electronCli":{"packagerConfig":{"asar":{"unpack":"**/*.node","ordering":"ordering.txt"}}}}"#,
+        )
+        .expect("package.json should be written");
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = PackageArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: None,
+            arch: None,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let snapshot = crate::project::inspect(&root).expect("project should inspect");
+        let report = build_report(snapshot, &args).expect("report should build");
+
+        assert!(report.asar.configured);
+        assert!(report.asar.enabled);
+        assert!(report.asar.archive.is_some());
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("packagerConfig.asar options")
+                && warning.contains("unpack")
+                && warning.contains("ordering")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
