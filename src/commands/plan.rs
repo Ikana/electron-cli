@@ -252,6 +252,7 @@ mod tests {
             package_json: Some(camino::Utf8PathBuf::from("/tmp/native-app/package.json")),
             name: Some("native-app".to_string()),
             version: Some("0.1.0".to_string()),
+            repository: None,
             license: None,
             main: Some("src/main.js".to_string()),
             package_manager: Some("npm".to_string()),

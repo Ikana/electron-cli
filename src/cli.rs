@@ -219,6 +219,30 @@ pub struct PublishArgs {
     #[arg(long, default_value = "out/publish/local", value_name = "PATH")]
     pub to: PathBuf,
 
+    /// GitHub repository to publish to, in OWNER/REPO form.
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub github_repo: Option<String>,
+
+    /// GitHub release tag. Defaults to v<package version>, then channel.
+    #[arg(long)]
+    pub github_tag: Option<String>,
+
+    /// GitHub release name. Defaults to the release tag.
+    #[arg(long)]
+    pub github_release_name: Option<String>,
+
+    /// Mark a newly created GitHub release as draft.
+    #[arg(long)]
+    pub github_draft: bool,
+
+    /// Mark a newly created GitHub release as prerelease.
+    #[arg(long)]
+    pub github_prerelease: bool,
+
+    /// GitHub API base URL, useful for GitHub Enterprise.
+    #[arg(long, default_value = "https://api.github.com", value_name = "URL")]
+    pub github_api_url: String,
+
     /// Release channel label written into the publish manifest.
     #[arg(long, default_value = "default")]
     pub channel: String,
@@ -283,12 +307,14 @@ impl MakeTarget {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum PublishTarget {
+    Github,
     Local,
 }
 
 impl PublishTarget {
     pub fn as_str(self) -> &'static str {
         match self {
+            PublishTarget::Github => "github",
             PublishTarget::Local => "local",
         }
     }

@@ -15,6 +15,7 @@ pub struct ProjectSnapshot {
     pub package_json: Option<Utf8PathBuf>,
     pub name: Option<String>,
     pub version: Option<String>,
+    pub repository: Option<String>,
     pub license: Option<String>,
     pub main: Option<String>,
     pub package_manager: Option<String>,
@@ -129,6 +130,7 @@ pub fn inspect(cwd: &Path) -> Result<ProjectSnapshot> {
             .and_then(|package| package.get("version"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        repository: package_json.as_ref().and_then(repository_value),
         license: package_json
             .as_ref()
             .and_then(|package| package.get("license"))
@@ -149,6 +151,17 @@ pub fn inspect(cwd: &Path) -> Result<ProjectSnapshot> {
         forge_dependencies,
         signals,
     })
+}
+
+fn repository_value(package: &Value) -> Option<String> {
+    match package.get("repository") {
+        Some(Value::String(repository)) => Some(repository.clone()),
+        Some(Value::Object(repository)) => repository
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
 }
 
 fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
@@ -268,6 +281,25 @@ mod tests {
     }
 
     #[test]
+    fn inspects_repository_url() {
+        let root = unique_temp_dir("repository");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"repo-app","repository":{"type":"git","url":"git+https://github.com/Ikana/electron-cli.git"}}"#,
+        )
+        .expect("package.json should be written");
+
+        let snapshot = inspect(&root).expect("project should inspect");
+
+        assert_eq!(
+            snapshot.repository.as_deref(),
+            Some("git+https://github.com/Ikana/electron-cli.git")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn builds_electron_signals() {
         let mut scripts = BTreeMap::new();
         scripts.insert("start".to_string(), "electron-forge start".to_string());
@@ -322,5 +354,18 @@ mod tests {
         assert!(snapshot
             .signals
             .contains(&"electron command found in package scripts".to_string()));
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "electron-cli-project-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("temp dir should be created");
+        path
     }
 }
