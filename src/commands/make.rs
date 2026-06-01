@@ -30,6 +30,7 @@ use crate::{
 const MSI_AUTO_LAUNCH_FEATURE_ID: &str = "AutoLaunchFeature";
 const MSI_AUTO_LAUNCH_COMPONENT_ID: &str = "AutoLaunchRegistryComponent";
 const MSI_AUTO_LAUNCH_REGISTRY_ID: &str = "AutoLaunchRegistry";
+const MSI_MAIN_FEATURE_ID: &str = "MainFeature";
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct MakeReport {
@@ -99,6 +100,7 @@ struct MsiMakerConfig {
     reboot_mode: Option<String>,
     default_install_mode: Option<String>,
     auto_launch: Option<MsiAutoLaunchConfig>,
+    associate_extensions: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -125,6 +127,8 @@ struct MsiMakerPlan {
     default_install_mode: MsiInstallMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_launch: Option<MsiAutoLaunchPlan>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    file_associations: Vec<MsiFileAssociationPlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +141,14 @@ struct MsiAutoLaunchConfig {
 struct MsiAutoLaunchPlan {
     arguments: Vec<String>,
     registry_value: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MsiFileAssociationPlan {
+    extension: String,
+    prog_id: String,
+    mime_content_type: String,
+    description: String,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -467,6 +479,12 @@ fn msi_maker_plan(
                 arguments,
             }
         });
+    let file_associations = msi_file_associations(
+        configured.associate_extensions.as_deref(),
+        &name,
+        &exe,
+        warnings,
+    );
 
     Ok(Some(MsiMakerPlan {
         name,
@@ -487,6 +505,7 @@ fn msi_maker_plan(
         reboot_mode,
         default_install_mode,
         auto_launch,
+        file_associations,
     }))
 }
 
@@ -553,6 +572,76 @@ fn msi_install_mode(value: Option<&str>, warnings: &mut Vec<String>) -> MsiInsta
             ));
             MsiInstallMode::PerMachine
         }
+    }
+}
+
+fn msi_file_associations(
+    value: Option<&str>,
+    name: &str,
+    exe: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<MsiFileAssociationPlan> {
+    let extensions = msi_associated_extensions(value, warnings);
+    if extensions.is_empty() {
+        return Vec::new();
+    }
+
+    let short_app_name = msi_short_app_name(exe);
+    extensions
+        .into_iter()
+        .map(|extension| {
+            let prog_id = format!("{short_app_name}.{extension}");
+            MsiFileAssociationPlan {
+                description: format!("{name} {extension} File"),
+                mime_content_type: format!("application/{extension}"),
+                extension,
+                prog_id,
+            }
+        })
+        .collect()
+}
+
+fn msi_associated_extensions(value: Option<&str>, warnings: &mut Vec<String>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+
+    let mut extensions = Vec::new();
+    for candidate in value.split([',', ';']) {
+        let extension = candidate.trim().trim_start_matches('.').trim();
+        if extension.is_empty() {
+            continue;
+        }
+        if !extension
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '_' | '-'))
+        {
+            warnings.push(format!(
+                "maker-wix associateExtensions entry contains unsupported characters and will be skipped: {extension}."
+            ));
+            continue;
+        }
+        if !extensions
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(extension))
+        {
+            extensions.push(extension.to_string());
+        }
+    }
+
+    extensions
+}
+
+fn msi_short_app_name(exe: &str) -> String {
+    let stem = msi_exe_stem(exe).unwrap_or(exe);
+    let short = stem
+        .chars()
+        .filter(|char| char.is_ascii_alphanumeric())
+        .collect::<String>();
+    if short.is_empty() {
+        "App".to_string()
+    } else {
+        short
     }
 }
 
@@ -792,6 +881,7 @@ fn maker_wix_config(object: &serde_json::Map<String, JsonValue>) -> MsiMakerConf
         reboot_mode: maker_config_string(object, config, "rebootMode"),
         default_install_mode: maker_config_string(object, config, "defaultInstallMode"),
         auto_launch: maker_wix_auto_launch(object, config),
+        associate_extensions: maker_config_string(object, config, "associateExtensions"),
     }
 }
 
@@ -1075,6 +1165,16 @@ fn print_report(report: &MakeReport, json: bool) -> Result<()> {
         }
         if let Some(auto_launch) = &msi.auto_launch {
             println!("  auto launch: {}", auto_launch.registry_value);
+        }
+        if !msi.file_associations.is_empty() {
+            println!(
+                "  file associations: {}",
+                msi.file_associations
+                    .iter()
+                    .map(|association| association.extension.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
     }
 
@@ -1854,6 +1954,55 @@ fn create_msi_tables(installer: &mut Package<File>) -> Result<()> {
     )?;
     create_msi_table(
         installer,
+        "ProgId",
+        vec![
+            Column::build("ProgId").primary_key().text_string(255),
+            Column::build("ProgId_Parent").nullable().text_string(255),
+            Column::build("Class_")
+                .nullable()
+                .category(Category::Guid)
+                .string(38),
+            Column::build("Description").nullable().text_string(255),
+            Column::build("Icon_").nullable().id_string(72),
+            Column::build("IconIndex").nullable().int16(),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "Extension",
+        vec![
+            Column::build("Extension").primary_key().text_string(255),
+            Column::build("Component_").primary_key().id_string(72),
+            Column::build("ProgId_").nullable().text_string(255),
+            Column::build("MIME_").nullable().text_string(255),
+            Column::build("Feature_").id_string(38),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "MIME",
+        vec![
+            Column::build("ContentType").primary_key().text_string(255),
+            Column::build("Extension_").text_string(255),
+            Column::build("CLSID")
+                .nullable()
+                .category(Category::Guid)
+                .string(38),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "Verb",
+        vec![
+            Column::build("Extension_").primary_key().text_string(255),
+            Column::build("Verb").primary_key().text_string(255),
+            Column::build("Sequence").nullable().int16(),
+            Column::build("Command").nullable().formatted_string(255),
+            Column::build("Argument").nullable().formatted_string(255),
+        ],
+    )?;
+    create_msi_table(
+        installer,
         "Shortcut",
         vec![
             Column::build("Shortcut").primary_key().id_string(72),
@@ -1996,7 +2145,7 @@ fn insert_msi_rows(
     )?;
 
     let mut features = vec![vec![
-        s("MainFeature"),
+        s(MSI_MAIN_FEATURE_ID),
         Value::Null,
         s(&msi.name),
         s(format!("Install {}.", single_line(&msi.name))),
@@ -2053,7 +2202,7 @@ fn insert_msi_rows(
     let mut feature_components = payload
         .files
         .iter()
-        .map(|file| vec![s("MainFeature"), s(&file.component_id)])
+        .map(|file| vec![s(MSI_MAIN_FEATURE_ID), s(&file.component_id)])
         .collect::<Vec<_>>();
     if msi.auto_launch.is_some() {
         feature_components.push(vec![
@@ -2108,6 +2257,10 @@ fn insert_msi_rows(
                 s(MSI_AUTO_LAUNCH_COMPONENT_ID),
             ]],
         )?;
+    }
+
+    if let Some(component) = &payload.shortcut_component {
+        insert_msi_file_associations(installer, msi, component)?;
     }
 
     if let Some(icon) = &msi.icon {
@@ -2167,9 +2320,15 @@ fn insert_msi_rows(
             standard_action("ProcessComponents", 1600),
             standard_action("UnpublishFeatures", 1800),
             standard_action("RemoveRegistryValues", 2600),
+            standard_action("UnregisterExtensionInfo", 2700),
+            standard_action("UnregisterProgIdInfo", 2710),
+            standard_action("UnregisterMIMEInfo", 2720),
             standard_action("RemoveShortcuts", 3200),
             standard_action("RemoveFiles", 3500),
             standard_action("InstallFiles", 4000),
+            standard_action("RegisterExtensionInfo", 4300),
+            standard_action("RegisterProgIdInfo", 4310),
+            standard_action("RegisterMIMEInfo", 4320),
             standard_action("CreateShortcuts", 4500),
             standard_action("WriteRegistryValues", 5000),
             standard_action("RegisterUser", 6000),
@@ -2197,6 +2356,36 @@ fn insert_msi_rows(
             ),
             action_text("RemoveShortcuts", "Removing shortcuts", "Shortcut: [1]"),
             action_text(
+                "RegisterExtensionInfo",
+                "Registering file extensions",
+                "Extension: [1]",
+            ),
+            action_text(
+                "RegisterMIMEInfo",
+                "Registering MIME information",
+                "Content type: [1], Extension: [2]",
+            ),
+            action_text(
+                "RegisterProgIdInfo",
+                "Registering program identifiers",
+                "ProgId: [1]",
+            ),
+            action_text(
+                "UnregisterExtensionInfo",
+                "Removing file extension registrations",
+                "Extension: [1]",
+            ),
+            action_text(
+                "UnregisterMIMEInfo",
+                "Removing MIME registrations",
+                "Content type: [1], Extension: [2]",
+            ),
+            action_text(
+                "UnregisterProgIdInfo",
+                "Removing program identifiers",
+                "ProgId: [1]",
+            ),
+            action_text(
                 "WriteRegistryValues",
                 "Writing registry values",
                 "Key: [1], Name: [2], Value: [3]",
@@ -2223,6 +2412,236 @@ fn insert_msi_shortcut_properties(installer: &mut Package<File>, msi: &MsiMakerP
     }
 
     insert_msi_table_rows(installer, "MsiShortcutProperty", rows)
+}
+
+fn insert_msi_file_associations(
+    installer: &mut Package<File>,
+    msi: &MsiMakerPlan,
+    component: &str,
+) -> Result<()> {
+    if msi.file_associations.is_empty() {
+        return Ok(());
+    }
+
+    let short_app_name = msi_short_app_name(&msi.exe);
+    insert_msi_table_rows(
+        installer,
+        "Registry",
+        msi_file_association_registry_rows(msi, component, &short_app_name),
+    )?;
+
+    let icon = msi.icon.as_ref();
+    insert_msi_table_rows(
+        installer,
+        "ProgId",
+        msi.file_associations
+            .iter()
+            .map(|association| {
+                vec![
+                    s(&association.prog_id),
+                    Value::Null,
+                    Value::Null,
+                    s(&association.description),
+                    icon.map(|icon| s(&icon.id)).unwrap_or(Value::Null),
+                    icon.map(|_| Value::from(0)).unwrap_or(Value::Null),
+                ]
+            })
+            .collect(),
+    )?;
+    insert_msi_table_rows(
+        installer,
+        "Extension",
+        msi.file_associations
+            .iter()
+            .map(|association| {
+                vec![
+                    s(&association.extension),
+                    s(component),
+                    s(&association.prog_id),
+                    s(&association.mime_content_type),
+                    s(MSI_MAIN_FEATURE_ID),
+                ]
+            })
+            .collect(),
+    )?;
+    insert_msi_table_rows(
+        installer,
+        "MIME",
+        msi.file_associations
+            .iter()
+            .map(|association| {
+                vec![
+                    s(&association.mime_content_type),
+                    s(&association.extension),
+                    Value::Null,
+                ]
+            })
+            .collect(),
+    )?;
+    insert_msi_table_rows(
+        installer,
+        "Verb",
+        msi.file_associations
+            .iter()
+            .map(|association| {
+                vec![
+                    s(&association.extension),
+                    s("open"),
+                    Value::from(0),
+                    s(format!("Open {}", association.extension)),
+                    s("\"%1\""),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn msi_file_association_registry_rows(
+    msi: &MsiMakerPlan,
+    component: &str,
+    short_app_name: &str,
+) -> Vec<Vec<Value>> {
+    let capabilities = format!(r"SOFTWARE\{short_app_name}\Capabilities");
+    let exe = &msi.exe;
+    let open_command = format!("\"[INSTALLFOLDER]{exe}\" \"%1\"");
+    let mut rows = vec![
+        registry_row(
+            "AssocCapDescription",
+            2,
+            &capabilities,
+            Some("ApplicationDescription"),
+            &msi.name,
+            component,
+        ),
+        registry_row(
+            "AssocCapIcon",
+            2,
+            &capabilities,
+            Some("ApplicationIcon"),
+            &format!("[INSTALLFOLDER]{exe},0"),
+            component,
+        ),
+        registry_row(
+            "AssocCapName",
+            2,
+            &capabilities,
+            Some("ApplicationName"),
+            &msi.name,
+            component,
+        ),
+        registry_row(
+            "AssocCapDefaultIcon",
+            2,
+            &format!(r"{capabilities}\DefaultIcon"),
+            None,
+            &format!("[INSTALLFOLDER]{exe},1"),
+            component,
+        ),
+        registry_row(
+            "AssocCapOpenCommand",
+            2,
+            &format!(r"{capabilities}\shell\Open\command"),
+            None,
+            &open_command,
+            component,
+        ),
+        registry_row(
+            "AssocRegisteredApp",
+            2,
+            r"SOFTWARE\RegisteredApplications",
+            Some(short_app_name),
+            &capabilities,
+            component,
+        ),
+        registry_row(
+            "AssocAppPathDefault",
+            2,
+            &format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}"),
+            None,
+            &format!("[INSTALLFOLDER]{exe}"),
+            component,
+        ),
+        registry_row(
+            "AssocAppPathPath",
+            2,
+            &format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}"),
+            Some("Path"),
+            "[INSTALLFOLDER]",
+            component,
+        ),
+        registry_row(
+            "AssocAppFriendlyName",
+            2,
+            &format!(r"SOFTWARE\Classes\Applications\{exe}\shell\open"),
+            Some("FriendlyAppName"),
+            &msi.name,
+            component,
+        ),
+        registry_row(
+            "AssocAppOpenCommand",
+            2,
+            &format!(r"SOFTWARE\Classes\Applications\{exe}\shell\open\command"),
+            None,
+            &open_command,
+            component,
+        ),
+    ];
+
+    for (index, association) in msi.file_associations.iter().enumerate() {
+        let number = index + 1;
+        rows.push(registry_row(
+            &format!("AssocExt{number}File"),
+            2,
+            &format!(r"{capabilities}\FileAssociations"),
+            Some(&format!(".{}", association.extension)),
+            &association.prog_id,
+            component,
+        ));
+        rows.push(registry_row(
+            &format!("AssocExt{number}Mime"),
+            2,
+            &format!(r"{capabilities}\MIMEAssociations"),
+            Some(&association.mime_content_type),
+            &association.prog_id,
+            component,
+        ));
+        rows.push(registry_row(
+            &format!("AssocExt{number}Supported"),
+            2,
+            &format!(r"SOFTWARE\Classes\Applications\{exe}\SupportedTypes"),
+            Some(&format!(".{}", association.extension)),
+            "",
+            component,
+        ));
+        rows.push(registry_row(
+            &format!("AssocExt{number}FriendlyType"),
+            2,
+            &format!(r"SOFTWARE\Classes\{}", association.prog_id),
+            Some("FriendlyTypeName"),
+            &association.description,
+            component,
+        ));
+    }
+
+    rows
+}
+
+fn registry_row(
+    id: &str,
+    root: i32,
+    key: &str,
+    name: Option<&str>,
+    value: &str,
+    component: &str,
+) -> Vec<Value> {
+    vec![
+        s(id),
+        Value::from(root),
+        s(key),
+        name.map(s).unwrap_or(Value::Null),
+        s(value),
+        s(component),
+    ]
 }
 
 fn insert_msi_icon(installer: &mut Package<File>, icon: &MsiIconResource) -> Result<()> {
@@ -3294,6 +3713,7 @@ mod tests {
                             "installLevel":4,
                             "rebootMode":"Force",
                             "defaultInstallMode":"perUser",
+                            "associateExtensions":"desk,.plan;desk",
                             "features":{
                                 "autoLaunch":{
                                     "enabled":true,
@@ -3351,6 +3771,15 @@ mod tests {
         assert_eq!(msi.install_level, 4);
         assert_eq!(msi.reboot_mode, "Force");
         assert_eq!(msi.default_install_mode.as_str(), "perUser");
+        assert_eq!(msi.file_associations.len(), 2);
+        assert_eq!(msi.file_associations[0].extension, "desk");
+        assert_eq!(msi.file_associations[0].prog_id, "starterapp.desk");
+        assert_eq!(
+            msi.file_associations[0].mime_content_type,
+            "application/desk"
+        );
+        assert_eq!(msi.file_associations[1].extension, "plan");
+        assert_eq!(msi.file_associations[1].prog_id, "starterapp.plan");
         let auto_launch = msi
             .auto_launch
             .as_ref()
@@ -3828,6 +4257,10 @@ mod tests {
         assert!(installer.has_table("Media"));
         assert!(installer.has_table("MsiShortcutProperty"));
         assert!(installer.has_table("Registry"));
+        assert!(installer.has_table("ProgId"));
+        assert!(installer.has_table("Extension"));
+        assert!(installer.has_table("MIME"));
+        assert!(installer.has_table("Verb"));
         assert!(installer.has_stream("app.cab"));
 
         let properties = msi_rows(&mut installer, "Property");
@@ -3908,6 +4341,7 @@ mod tests {
                             "installLevel":4,
                             "rebootMode":"Force",
                             "defaultInstallMode":"perUser",
+                            "associateExtensions":"desk,.plan;desk",
                             "features":{
                                 "autoLaunch":{
                                     "enabled":true,
@@ -4016,6 +4450,93 @@ mod tests {
             Value::from("com.acme.desk"),
             Value::from("\"[INSTALLFOLDER]starter-app.exe\" --hidden --profile Default"),
             Value::from("AutoLaunchRegistryComponent")
+        ]));
+        assert!(registry.contains(&vec![
+            Value::from("AssocCapDescription"),
+            Value::from(2),
+            Value::from(r"SOFTWARE\starterapp\Capabilities"),
+            Value::from("ApplicationDescription"),
+            Value::from("Desk Suite"),
+            Value::from("C0002")
+        ]));
+        assert!(registry.contains(&vec![
+            Value::from("AssocRegisteredApp"),
+            Value::from(2),
+            Value::from(r"SOFTWARE\RegisteredApplications"),
+            Value::from("starterapp"),
+            Value::from(r"SOFTWARE\starterapp\Capabilities"),
+            Value::from("C0002")
+        ]));
+        assert!(registry.contains(&vec![
+            Value::from("AssocExt1File"),
+            Value::from(2),
+            Value::from(r"SOFTWARE\starterapp\Capabilities\FileAssociations"),
+            Value::from(".desk"),
+            Value::from("starterapp.desk"),
+            Value::from("C0002")
+        ]));
+        assert!(registry.contains(&vec![
+            Value::from("AssocExt2Supported"),
+            Value::from(2),
+            Value::from(r"SOFTWARE\Classes\Applications\starter-app.exe\SupportedTypes"),
+            Value::from(".plan"),
+            Value::from(""),
+            Value::from("C0002")
+        ]));
+
+        let prog_ids = msi_rows(&mut installer, "ProgId");
+        assert!(prog_ids.contains(&vec![
+            Value::from("starterapp.desk"),
+            Value::Null,
+            Value::Null,
+            Value::from("Desk Suite desk File"),
+            Value::from("AppIcon.ico"),
+            Value::from(0)
+        ]));
+        assert!(prog_ids.contains(&vec![
+            Value::from("starterapp.plan"),
+            Value::Null,
+            Value::Null,
+            Value::from("Desk Suite plan File"),
+            Value::from("AppIcon.ico"),
+            Value::from(0)
+        ]));
+
+        let extensions = msi_rows(&mut installer, "Extension");
+        assert!(extensions.contains(&vec![
+            Value::from("desk"),
+            Value::from("C0002"),
+            Value::from("starterapp.desk"),
+            Value::from("application/desk"),
+            Value::from("MainFeature")
+        ]));
+        assert!(extensions.contains(&vec![
+            Value::from("plan"),
+            Value::from("C0002"),
+            Value::from("starterapp.plan"),
+            Value::from("application/plan"),
+            Value::from("MainFeature")
+        ]));
+
+        let mime = msi_rows(&mut installer, "MIME");
+        assert!(mime.contains(&vec![
+            Value::from("application/desk"),
+            Value::from("desk"),
+            Value::Null
+        ]));
+        assert!(mime.contains(&vec![
+            Value::from("application/plan"),
+            Value::from("plan"),
+            Value::Null
+        ]));
+
+        let verbs = msi_rows(&mut installer, "Verb");
+        assert!(verbs.contains(&vec![
+            Value::from("desk"),
+            Value::from("open"),
+            Value::from(0),
+            Value::from("Open desk"),
+            Value::from("\"%1\"")
         ]));
 
         let directories = msi_rows(&mut installer, "Directory");
