@@ -12,7 +12,7 @@ use camino::Utf8PathBuf;
 use fatfs::{Dir as FatDir, FileSystem, FormatVolumeOptions, FsOptions, ReadWriteSeek};
 use flate2::{write::GzEncoder, Compression};
 use fscommon::BufStream;
-use msi::{Column, Insert, Language, Package, PackageType, Value};
+use msi::{Category, Column, Insert, Language, Package, PackageType, Value};
 use rpm::{BuildConfig, CompressionType, FileOptions, PackageBuilder};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -26,6 +26,10 @@ use crate::{
     output,
     project::ProjectSnapshot,
 };
+
+const MSI_AUTO_LAUNCH_FEATURE_ID: &str = "AutoLaunchFeature";
+const MSI_AUTO_LAUNCH_COMPONENT_ID: &str = "AutoLaunchRegistryComponent";
+const MSI_AUTO_LAUNCH_REGISTRY_ID: &str = "AutoLaunchRegistry";
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct MakeReport {
@@ -93,6 +97,7 @@ struct MsiMakerConfig {
     upgrade_code: Option<String>,
     install_level: Option<i32>,
     reboot_mode: Option<String>,
+    auto_launch: Option<MsiAutoLaunchConfig>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -116,6 +121,20 @@ struct MsiMakerPlan {
     upgrade_code: String,
     install_level: i32,
     reboot_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_launch: Option<MsiAutoLaunchPlan>,
+}
+
+#[derive(Clone, Debug)]
+struct MsiAutoLaunchConfig {
+    enabled: bool,
+    arguments: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MsiAutoLaunchPlan {
+    arguments: Vec<String>,
+    registry_value: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -396,6 +415,17 @@ fn msi_maker_plan(
         .as_deref()
         .and_then(normalized_msi_text)
         .unwrap_or_else(|| "ReallySuppress".to_string());
+    let auto_launch = configured
+        .auto_launch
+        .as_ref()
+        .filter(|auto_launch| auto_launch.enabled)
+        .map(|auto_launch| {
+            let arguments = normalized_msi_arguments(&auto_launch.arguments);
+            MsiAutoLaunchPlan {
+                registry_value: msi_auto_launch_registry_value(&exe, &arguments),
+                arguments,
+            }
+        });
 
     Ok(Some(MsiMakerPlan {
         name,
@@ -414,6 +444,7 @@ fn msi_maker_plan(
         upgrade_code,
         install_level,
         reboot_mode,
+        auto_launch,
     }))
 }
 
@@ -448,6 +479,22 @@ fn normalized_msi_text(value: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+fn normalized_msi_arguments(arguments: &[String]) -> Vec<String> {
+    arguments
+        .iter()
+        .filter_map(|argument| normalized_msi_text(argument))
+        .collect()
+}
+
+fn msi_auto_launch_registry_value(exe: &str, arguments: &[String]) -> String {
+    let suffix = if arguments.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", arguments.join(" "))
+    };
+    format!("\"[INSTALLFOLDER]{exe}\"{suffix}")
 }
 
 fn default_msi_upgrade_code(package: &PackageReport, name: &str) -> String {
@@ -669,7 +716,7 @@ fn maker_wix_config(object: &serde_json::Map<String, JsonValue>) -> MsiMakerConf
     let config = object.get("config");
     MsiMakerConfig {
         description: maker_config_string(object, config, "description"),
-        name: maker_config_string(object, config, "name"),
+        name: maker_nested_config_string(config, "name"),
         version: maker_config_string(object, config, "version"),
         manufacturer: maker_config_string(object, config, "manufacturer"),
         exe: maker_config_string(object, config, "exe"),
@@ -684,6 +731,48 @@ fn maker_wix_config(object: &serde_json::Map<String, JsonValue>) -> MsiMakerConf
         upgrade_code: maker_config_string(object, config, "upgradeCode"),
         install_level: maker_config_i32(object, config, "installLevel"),
         reboot_mode: maker_config_string(object, config, "rebootMode"),
+        auto_launch: maker_wix_auto_launch(object, config),
+    }
+}
+
+fn maker_nested_config_string(config: Option<&JsonValue>, key: &str) -> Option<String> {
+    config
+        .and_then(|config| config.get(key))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn maker_wix_auto_launch(
+    object: &serde_json::Map<String, JsonValue>,
+    config: Option<&JsonValue>,
+) -> Option<MsiAutoLaunchConfig> {
+    let auto_launch = config
+        .and_then(|config| config.get("features"))
+        .or_else(|| object.get("features"))
+        .and_then(|features| features.get("autoLaunch"))?;
+
+    match auto_launch {
+        JsonValue::Bool(true) => Some(MsiAutoLaunchConfig {
+            enabled: true,
+            arguments: Vec::new(),
+        }),
+        JsonValue::Object(options) => {
+            let enabled = options
+                .get("enabled")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            if !enabled {
+                return None;
+            }
+
+            Some(MsiAutoLaunchConfig {
+                enabled: true,
+                arguments: string_values(options.get("arguments")),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -919,6 +1008,9 @@ fn print_report(report: &MakeReport, json: bool) -> Result<()> {
         }
         if let Some(clsid) = &msi.toast_activator_clsid {
             println!("  toast activator clsid: {clsid}");
+        }
+        if let Some(auto_launch) = &msi.auto_launch {
+            println!("  auto launch: {}", auto_launch.registry_value);
         }
     }
 
@@ -1728,6 +1820,18 @@ fn create_msi_tables(installer: &mut Package<File>) -> Result<()> {
     )?;
     create_msi_table(
         installer,
+        "Registry",
+        vec![
+            Column::build("Registry").primary_key().id_string(72),
+            Column::build("Root").int16(),
+            Column::build("Key").category(Category::RegPath).string(255),
+            Column::build("Name").nullable().formatted_string(255),
+            Column::build("Value").nullable().formatted_string(0),
+            Column::build("Component_").id_string(72),
+        ],
+    )?;
+    create_msi_table(
+        installer,
         "RemoveFile",
         vec![
             Column::build("FileKey").primary_key().id_string(72),
@@ -1823,49 +1927,73 @@ fn insert_msi_rows(
             .collect(),
     )?;
 
-    insert_msi_table_rows(
-        installer,
-        "Feature",
-        vec![vec![
-            s("MainFeature"),
+    let mut features = vec![vec![
+        s("MainFeature"),
+        Value::Null,
+        s(&msi.name),
+        s(format!("Install {}.", single_line(&msi.name))),
+        Value::from(1),
+        Value::from(msi.install_level),
+        s("INSTALLFOLDER"),
+        Value::from(0),
+    ]];
+    if msi.auto_launch.is_some() {
+        features.push(vec![
+            s(MSI_AUTO_LAUNCH_FEATURE_ID),
             Value::Null,
-            s(&msi.name),
-            s(format!("Install {}.", single_line(&msi.name))),
-            Value::from(1),
-            Value::from(msi.install_level),
+            s("Launch On Login"),
+            s("Enables launch on login for all users on this machine."),
+            Value::Null,
+            Value::from(2),
             s("INSTALLFOLDER"),
             Value::from(0),
-        ]],
-    )?;
+        ]);
+    }
+    insert_msi_table_rows(installer, "Feature", features)?;
 
     let component_attributes = msi_component_attributes(package.arch());
-    insert_msi_table_rows(
-        installer,
-        "Component",
-        payload
-            .files
-            .iter()
-            .map(|file| {
-                vec![
-                    s(&file.component_id),
-                    s(&file.component_guid),
-                    s(&file.directory_id),
-                    Value::from(component_attributes),
-                    Value::Null,
-                    s(&file.id),
-                ]
-            })
-            .collect(),
-    )?;
-    insert_msi_table_rows(
-        installer,
-        "FeatureComponents",
-        payload
-            .files
-            .iter()
-            .map(|file| vec![s("MainFeature"), s(&file.component_id)])
-            .collect(),
-    )?;
+    let mut components = payload
+        .files
+        .iter()
+        .map(|file| {
+            vec![
+                s(&file.component_id),
+                s(&file.component_guid),
+                s(&file.directory_id),
+                Value::from(component_attributes),
+                Value::Null,
+                s(&file.id),
+            ]
+        })
+        .collect::<Vec<_>>();
+    if msi.auto_launch.is_some() {
+        let component_guid = msi_guid(deterministic_guid(
+            "auto-launch-component",
+            &[&msi.name, &msi.app_user_model_id, &msi.exe],
+        ));
+        components.push(vec![
+            s(MSI_AUTO_LAUNCH_COMPONENT_ID),
+            s(component_guid),
+            s("INSTALLFOLDER"),
+            Value::from(component_attributes),
+            Value::Null,
+            s(MSI_AUTO_LAUNCH_REGISTRY_ID),
+        ]);
+    }
+    insert_msi_table_rows(installer, "Component", components)?;
+
+    let mut feature_components = payload
+        .files
+        .iter()
+        .map(|file| vec![s("MainFeature"), s(&file.component_id)])
+        .collect::<Vec<_>>();
+    if msi.auto_launch.is_some() {
+        feature_components.push(vec![
+            s(MSI_AUTO_LAUNCH_FEATURE_ID),
+            s(MSI_AUTO_LAUNCH_COMPONENT_ID),
+        ]);
+    }
+    insert_msi_table_rows(installer, "FeatureComponents", feature_components)?;
     insert_msi_table_rows(
         installer,
         "File",
@@ -1898,6 +2026,21 @@ fn insert_msi_rows(
             Value::Null,
         ]],
     )?;
+
+    if let Some(auto_launch) = &msi.auto_launch {
+        insert_msi_table_rows(
+            installer,
+            "Registry",
+            vec![vec![
+                s(MSI_AUTO_LAUNCH_REGISTRY_ID),
+                Value::from(-1),
+                s(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+                s(&msi.app_user_model_id),
+                s(&auto_launch.registry_value),
+                s(MSI_AUTO_LAUNCH_COMPONENT_ID),
+            ]],
+        )?;
+    }
 
     if let Some(icon) = &msi.icon {
         insert_msi_icon(installer, icon)?;
@@ -1955,10 +2098,12 @@ fn insert_msi_rows(
             standard_action("InstallInitialize", 1500),
             standard_action("ProcessComponents", 1600),
             standard_action("UnpublishFeatures", 1800),
+            standard_action("RemoveRegistryValues", 2600),
             standard_action("RemoveShortcuts", 3200),
             standard_action("RemoveFiles", 3500),
             standard_action("InstallFiles", 4000),
             standard_action("CreateShortcuts", 4500),
+            standard_action("WriteRegistryValues", 5000),
             standard_action("RegisterUser", 6000),
             standard_action("RegisterProduct", 6100),
             standard_action("PublishFeatures", 6300),
@@ -1977,7 +2122,17 @@ fn insert_msi_rows(
             ),
             action_text("CreateShortcuts", "Creating shortcuts", "Shortcut: [1]"),
             action_text("RemoveFiles", "Removing files", "File: [1], Directory: [9]"),
+            action_text(
+                "RemoveRegistryValues",
+                "Removing registry values",
+                "Key: [1], Name: [2]",
+            ),
             action_text("RemoveShortcuts", "Removing shortcuts", "Shortcut: [1]"),
+            action_text(
+                "WriteRegistryValues",
+                "Writing registry values",
+                "Key: [1], Name: [2], Value: [3]",
+            ),
         ],
     )
 }
@@ -3069,7 +3224,13 @@ mod tests {
                             "shortcutName":"Launch Desk",
                             "upgradeCode":"11111111-2222-3333-4444-555555555555",
                             "installLevel":4,
-                            "rebootMode":"Force"
+                            "rebootMode":"Force",
+                            "features":{
+                                "autoLaunch":{
+                                    "enabled":true,
+                                    "arguments":["--hidden", "--profile", "Default"]
+                                }
+                            }
                         }
                     }
                 ]}}
@@ -3120,6 +3281,18 @@ mod tests {
         assert_eq!(msi.upgrade_code, "{11111111-2222-3333-4444-555555555555}");
         assert_eq!(msi.install_level, 4);
         assert_eq!(msi.reboot_mode, "Force");
+        let auto_launch = msi
+            .auto_launch
+            .as_ref()
+            .expect("auto launch should be enabled");
+        assert_eq!(
+            auto_launch.arguments,
+            vec!["--hidden", "--profile", "Default"]
+        );
+        assert_eq!(
+            auto_launch.registry_value,
+            "\"[INSTALLFOLDER]starter-app.exe\" --hidden --profile Default"
+        );
         assert!(Path::new(report.artifact.as_str()).ends_with(
             PathBuf::from("out")
                 .join("make")
@@ -3132,6 +3305,50 @@ mod tests {
             .warnings()
             .iter()
             .any(|warning| warning.contains("will be transformed to \"2.3.4\"")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reads_maker_wix_auto_launch_bool() {
+        let root = unique_temp_dir("configured-maker-wix-auto-launch");
+        write_package_json_with_makers(
+            &root,
+            r#"[
+                {
+                    "name":"@electron-forge/maker-wix",
+                    "platforms":["win32"],
+                    "config":{"features":{"autoLaunch":true}}
+                }
+            ]"#,
+        );
+        write_app_file(&root);
+        write_fake_electron_dist(&root);
+
+        let args = MakeArgs {
+            cwd: root.clone(),
+            out_dir: PathBuf::from("out"),
+            name: None,
+            platform: Some("win32".to_string()),
+            arch: Some("x64".to_string()),
+            target: None,
+            skip_package: false,
+            force: false,
+            dry_run: true,
+            json: true,
+        };
+        let report = build_report(&args).expect("report should build");
+        let auto_launch = report
+            .msi
+            .as_ref()
+            .and_then(|msi| msi.auto_launch.as_ref())
+            .expect("auto launch should be enabled");
+
+        assert!(auto_launch.arguments.is_empty());
+        assert_eq!(
+            auto_launch.registry_value,
+            "\"[INSTALLFOLDER]starter-app.exe\""
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3537,6 +3754,7 @@ mod tests {
         assert!(installer.has_table("File"));
         assert!(installer.has_table("Media"));
         assert!(installer.has_table("MsiShortcutProperty"));
+        assert!(installer.has_table("Registry"));
         assert!(installer.has_stream("app.cab"));
 
         let properties = msi_rows(&mut installer, "Property");
@@ -3613,7 +3831,13 @@ mod tests {
                             "shortcutName":"Launch Desk",
                             "upgradeCode":"11111111-2222-3333-4444-555555555555",
                             "installLevel":4,
-                            "rebootMode":"Force"
+                            "rebootMode":"Force",
+                            "features":{
+                                "autoLaunch":{
+                                    "enabled":true,
+                                    "arguments":["--hidden", "--profile", "Default"]
+                                }
+                            }
                         }
                     }
                 ]}}
@@ -3686,6 +3910,34 @@ mod tests {
         assert!(features
             .iter()
             .any(|row| row[0] == Value::from("MainFeature") && row[5] == Value::from(4)));
+        assert!(features.iter().any(|row| {
+            row[0] == Value::from("AutoLaunchFeature")
+                && row[2] == Value::from("Launch On Login")
+                && row[5] == Value::from(2)
+        }));
+
+        let components = msi_rows(&mut installer, "Component");
+        assert!(components.iter().any(|row| {
+            row[0] == Value::from("AutoLaunchRegistryComponent")
+                && row[2] == Value::from("INSTALLFOLDER")
+                && row[5] == Value::from("AutoLaunchRegistry")
+        }));
+
+        let feature_components = msi_rows(&mut installer, "FeatureComponents");
+        assert!(feature_components.contains(&vec![
+            Value::from("AutoLaunchFeature"),
+            Value::from("AutoLaunchRegistryComponent")
+        ]));
+
+        let registry = msi_rows(&mut installer, "Registry");
+        assert!(registry.contains(&vec![
+            Value::from("AutoLaunchRegistry"),
+            Value::from(-1),
+            Value::from(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+            Value::from("com.acme.desk"),
+            Value::from("\"[INSTALLFOLDER]starter-app.exe\" --hidden --profile Default"),
+            Value::from("AutoLaunchRegistryComponent")
+        ]));
 
         let directories = msi_rows(&mut installer, "Directory");
         assert!(directories.iter().any(|row| {
