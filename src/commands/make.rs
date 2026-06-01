@@ -83,6 +83,9 @@ struct MsiMakerConfig {
     manufacturer: Option<String>,
     exe: Option<String>,
     icon: Option<String>,
+    short_name: Option<String>,
+    app_user_model_id: Option<String>,
+    toast_activator_clsid: Option<String>,
     language: Option<u16>,
     program_files_folder_name: Option<String>,
     shortcut_folder_name: Option<String>,
@@ -102,6 +105,10 @@ struct MsiMakerPlan {
     exe: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     icon: Option<MsiIconResource>,
+    short_name: String,
+    app_user_model_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    toast_activator_clsid: Option<String>,
     language: u16,
     program_files_folder_name: String,
     shortcut_folder_name: String,
@@ -340,6 +347,21 @@ fn msi_maker_plan(
         .and_then(normalized_msi_text)
         .unwrap_or_else(|| format!("{name}.exe"));
     let icon = msi_icon_plan(package, configured.icon.as_deref(), warnings)?;
+    let short_name = configured
+        .short_name
+        .as_deref()
+        .and_then(normalized_msi_text)
+        .unwrap_or_else(|| name.clone());
+    let app_user_model_id = configured
+        .app_user_model_id
+        .as_deref()
+        .and_then(normalized_msi_text)
+        .unwrap_or_else(|| default_msi_app_user_model_id(&short_name, &exe));
+    let toast_activator_clsid = configured
+        .toast_activator_clsid
+        .as_deref()
+        .and_then(normalized_msi_text)
+        .map(normalized_msi_clsid);
     let language = configured.language.unwrap_or(1033);
     let program_files_folder_name = configured
         .program_files_folder_name
@@ -382,6 +404,9 @@ fn msi_maker_plan(
         description,
         exe,
         icon,
+        short_name,
+        app_user_model_id,
+        toast_activator_clsid,
         language,
         program_files_folder_name,
         shortcut_folder_name,
@@ -430,6 +455,32 @@ fn default_msi_upgrade_code(package: &PackageReport, name: &str) -> String {
         "upgrade-code",
         &[name, package.project().name.as_deref().unwrap_or("")],
     ))
+}
+
+fn default_msi_app_user_model_id(short_name: &str, exe: &str) -> String {
+    format!(
+        "com.squirrel.{}.{}",
+        short_name,
+        msi_exe_stem(exe).unwrap_or(exe)
+    )
+    .to_ascii_lowercase()
+}
+
+fn msi_exe_stem(exe: &str) -> Option<&str> {
+    let trimmed = exe.trim();
+    if trimmed.len() > 4 && trimmed[trimmed.len() - 4..].eq_ignore_ascii_case(".exe") {
+        Some(&trimmed[..trimmed.len() - 4])
+    } else {
+        None
+    }
+}
+
+fn normalized_msi_clsid(value: String) -> String {
+    if value.starts_with('{') && value.ends_with('}') {
+        value
+    } else {
+        format!("{{{value}}}")
+    }
 }
 
 fn parse_msi_guid(value: &str) -> Option<Uuid> {
@@ -623,6 +674,9 @@ fn maker_wix_config(object: &serde_json::Map<String, JsonValue>) -> MsiMakerConf
         manufacturer: maker_config_string(object, config, "manufacturer"),
         exe: maker_config_string(object, config, "exe"),
         icon: maker_config_string(object, config, "icon"),
+        short_name: maker_config_string(object, config, "shortName"),
+        app_user_model_id: maker_config_string(object, config, "appUserModelId"),
+        toast_activator_clsid: maker_config_string(object, config, "toastActivatorClsid"),
         language: maker_config_u16(object, config, "language"),
         program_files_folder_name: maker_config_string(object, config, "programFilesFolderName"),
         shortcut_folder_name: maker_config_string(object, config, "shortcutFolderName"),
@@ -851,6 +905,8 @@ fn print_report(report: &MakeReport, json: bool) -> Result<()> {
         println!("  version: {}", msi.version);
         println!("  manufacturer: {}", msi.manufacturer);
         println!("  exe: {}", msi.exe);
+        println!("  short name: {}", msi.short_name);
+        println!("  app user model id: {}", msi.app_user_model_id);
         println!("  language: {}", msi.language);
         println!("  install folder: {}", msi.program_files_folder_name);
         println!("  shortcut folder: {}", msi.shortcut_folder_name);
@@ -860,6 +916,9 @@ fn print_report(report: &MakeReport, json: bool) -> Result<()> {
         println!("  reboot mode: {}", msi.reboot_mode);
         if let Some(description) = &msi.description {
             println!("  description: {description}");
+        }
+        if let Some(clsid) = &msi.toast_activator_clsid {
+            println!("  toast activator clsid: {clsid}");
         }
     }
 
@@ -1546,7 +1605,7 @@ fn write_msi_summary(
     summary.set_uuid(package_code);
     summary.set_arch(arch.to_string());
     summary.set_languages(&[language]);
-    summary.set_page_count(200);
+    summary.set_page_count(500);
     summary.set_word_count(2);
     Ok(())
 }
@@ -1653,6 +1712,18 @@ fn create_msi_tables(installer: &mut Package<File>) -> Result<()> {
             Column::build("IconIndex").nullable().int16(),
             Column::build("ShowCmd").nullable().int16(),
             Column::build("WkDir").nullable().id_string(72),
+        ],
+    )?;
+    create_msi_table(
+        installer,
+        "MsiShortcutProperty",
+        vec![
+            Column::build("MsiShortcutProperty")
+                .primary_key()
+                .id_string(72),
+            Column::build("Shortcut_").id_string(72),
+            Column::build("PropertyKey").formatted_string(0),
+            Column::build("PropVariantValue").formatted_string(0),
         ],
     )?;
     create_msi_table(
@@ -1859,6 +1930,7 @@ fn insert_msi_rows(
                 s("INSTALLFOLDER"),
             ]],
         )?;
+        insert_msi_shortcut_properties(installer, msi)?;
         insert_msi_table_rows(
             installer,
             "RemoveFile",
@@ -1908,6 +1980,26 @@ fn insert_msi_rows(
             action_text("RemoveShortcuts", "Removing shortcuts", "Shortcut: [1]"),
         ],
     )
+}
+
+fn insert_msi_shortcut_properties(installer: &mut Package<File>, msi: &MsiMakerPlan) -> Result<()> {
+    let mut rows = vec![vec![
+        s("ApplicationShortcutAppUserModelId"),
+        s("ApplicationShortcut"),
+        s("System.AppUserModel.ID"),
+        s(&msi.app_user_model_id),
+    ]];
+
+    if let Some(clsid) = &msi.toast_activator_clsid {
+        rows.push(vec![
+            s("ApplicationShortcutToastActivatorClsid"),
+            s("ApplicationShortcut"),
+            s("System.AppUserModel.ToastActivatorCLSID"),
+            s(clsid),
+        ]);
+    }
+
+    insert_msi_table_rows(installer, "MsiShortcutProperty", rows)
 }
 
 fn insert_msi_icon(installer: &mut Package<File>, icon: &MsiIconResource) -> Result<()> {
@@ -2968,6 +3060,9 @@ mod tests {
                             "description":"Desk workflows",
                             "exe":"starter-app.exe",
                             "icon":"assets/app.ico",
+                            "shortName":"DeskSuite",
+                            "appUserModelId":"com.acme.desk",
+                            "toastActivatorClsid":"22222222-3333-4444-5555-666666666666",
                             "language":1043,
                             "programFilesFolderName":"Desk Suite Install",
                             "shortcutFolderName":"Desk Tools",
@@ -3013,6 +3108,12 @@ mod tests {
             icon_bytes
         );
         assert_eq!(msi.language, 1043);
+        assert_eq!(msi.short_name, "DeskSuite");
+        assert_eq!(msi.app_user_model_id, "com.acme.desk");
+        assert_eq!(
+            msi.toast_activator_clsid.as_deref(),
+            Some("{22222222-3333-4444-5555-666666666666}")
+        );
         assert_eq!(msi.program_files_folder_name, "Desk Suite Install");
         assert_eq!(msi.shortcut_folder_name, "Desk Tools");
         assert_eq!(msi.shortcut_name, "Launch Desk");
@@ -3430,10 +3531,12 @@ mod tests {
 
         let mut installer = msi::open(report.artifact.as_str()).expect("msi should parse");
         assert_eq!(installer.summary_info().arch(), Some("x64"));
+        assert_eq!(installer.summary_info().page_count(), Some(500));
         assert!(installer.has_table("Property"));
         assert!(installer.has_table("Directory"));
         assert!(installer.has_table("File"));
         assert!(installer.has_table("Media"));
+        assert!(installer.has_table("MsiShortcutProperty"));
         assert!(installer.has_stream("app.cab"));
 
         let properties = msi_rows(&mut installer, "Property");
@@ -3442,6 +3545,13 @@ mod tests {
             Value::from("starter-app")
         ]));
         assert!(properties.contains(&vec![Value::from("ProductVersion"), Value::from("0.1.0")]));
+
+        let shortcut_properties = msi_rows(&mut installer, "MsiShortcutProperty");
+        assert!(shortcut_properties.iter().any(|row| {
+            row[1] == Value::from("ApplicationShortcut")
+                && row[2] == Value::from("System.AppUserModel.ID")
+                && row[3] == Value::from("com.squirrel.starter-app.starter-app")
+        }));
 
         let files = msi_rows(&mut installer, "File");
         assert!(files
@@ -3494,6 +3604,9 @@ mod tests {
                             "description":"Desk workflows",
                             "exe":"starter-app.exe",
                             "icon":"assets/app.ico",
+                            "shortName":"DeskSuite",
+                            "appUserModelId":"com.acme.desk",
+                            "toastActivatorClsid":"22222222-3333-4444-5555-666666666666",
                             "language":1043,
                             "programFilesFolderName":"Desk Suite Install",
                             "shortcutFolderName":"Desk Tools",
@@ -3591,6 +3704,20 @@ mod tests {
                 && row[6] == Value::from("Desk workflows")
                 && row[8] == Value::from("AppIcon.ico")
         }));
+
+        let shortcut_properties = msi_rows(&mut installer, "MsiShortcutProperty");
+        assert!(shortcut_properties.contains(&vec![
+            Value::from("ApplicationShortcutAppUserModelId"),
+            Value::from("ApplicationShortcut"),
+            Value::from("System.AppUserModel.ID"),
+            Value::from("com.acme.desk")
+        ]));
+        assert!(shortcut_properties.contains(&vec![
+            Value::from("ApplicationShortcutToastActivatorClsid"),
+            Value::from("ApplicationShortcut"),
+            Value::from("System.AppUserModel.ToastActivatorCLSID"),
+            Value::from("{22222222-3333-4444-5555-666666666666}")
+        ]));
 
         let _ = fs::remove_dir_all(root);
     }
