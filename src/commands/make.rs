@@ -31,6 +31,9 @@ const MSI_AUTO_LAUNCH_FEATURE_ID: &str = "AutoLaunchFeature";
 const MSI_AUTO_LAUNCH_COMPONENT_ID: &str = "AutoLaunchRegistryComponent";
 const MSI_AUTO_LAUNCH_REGISTRY_ID: &str = "AutoLaunchRegistry";
 const MSI_MAIN_FEATURE_ID: &str = "MainFeature";
+const MSI_AUTO_RUN_ACTION_ID: &str = "LaunchScriptAfter";
+const MSI_AUTO_RUN_CUSTOM_ACTION_TYPE: i32 = 34;
+const MSI_AUTO_RUN_SEQUENCE: i32 = 6601;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct MakeReport {
@@ -101,6 +104,7 @@ struct MsiMakerConfig {
     default_install_mode: Option<String>,
     auto_launch: Option<MsiAutoLaunchConfig>,
     associate_extensions: Option<String>,
+    auto_run: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -129,6 +133,8 @@ struct MsiMakerPlan {
     auto_launch: Option<MsiAutoLaunchPlan>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     file_associations: Vec<MsiFileAssociationPlan>,
+    #[serde(skip_serializing_if = "is_false")]
+    auto_run: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -485,6 +491,7 @@ fn msi_maker_plan(
         &exe,
         warnings,
     );
+    let auto_run = configured.auto_run.unwrap_or(false);
 
     Ok(Some(MsiMakerPlan {
         name,
@@ -506,6 +513,7 @@ fn msi_maker_plan(
         default_install_mode,
         auto_launch,
         file_associations,
+        auto_run,
     }))
 }
 
@@ -882,6 +890,7 @@ fn maker_wix_config(object: &serde_json::Map<String, JsonValue>) -> MsiMakerConf
         default_install_mode: maker_config_string(object, config, "defaultInstallMode"),
         auto_launch: maker_wix_auto_launch(object, config),
         associate_extensions: maker_config_string(object, config, "associateExtensions"),
+        auto_run: maker_config_bool(object, config, "autoRun"),
     }
 }
 
@@ -968,6 +977,17 @@ fn maker_config_i32(
         JsonValue::String(value) => value.trim().parse::<i32>().ok(),
         _ => None,
     }
+}
+
+fn maker_config_bool(
+    object: &serde_json::Map<String, JsonValue>,
+    config: Option<&JsonValue>,
+    key: &str,
+) -> Option<bool> {
+    config
+        .and_then(|config| config.get(key))
+        .or_else(|| object.get(key))
+        .and_then(JsonValue::as_bool)
 }
 
 fn maker_target(label: &str) -> Option<MakeTarget> {
@@ -1165,6 +1185,9 @@ fn print_report(report: &MakeReport, json: bool) -> Result<()> {
         }
         if let Some(auto_launch) = &msi.auto_launch {
             println!("  auto launch: {}", auto_launch.registry_value);
+        }
+        if msi.auto_run {
+            println!("  auto run: enabled");
         }
         if !msi.file_associations.is_empty() {
             println!(
@@ -2056,6 +2079,20 @@ fn create_msi_tables(installer: &mut Package<File>) -> Result<()> {
     )?;
     create_msi_table(
         installer,
+        "CustomAction",
+        vec![
+            Column::build("Action").primary_key().id_string(72),
+            Column::build("Type").int16(),
+            Column::build("Source")
+                .nullable()
+                .category(Category::CustomSource)
+                .string(72),
+            Column::build("Target").nullable().formatted_string(0),
+            Column::build("ExtendedType").nullable().int32(),
+        ],
+    )?;
+    create_msi_table(
+        installer,
         "InstallExecuteSequence",
         vec![
             Column::build("Action").primary_key().id_string(72),
@@ -2267,6 +2304,10 @@ fn insert_msi_rows(
         insert_msi_icon(installer, icon)?;
     }
 
+    if msi.auto_run {
+        insert_msi_auto_run(installer, msi)?;
+    }
+
     if let (Some(component), Some(target_file)) =
         (&payload.shortcut_component, &payload.shortcut_target_file)
     {
@@ -2308,35 +2349,43 @@ fn insert_msi_rows(
         )?;
     }
 
+    let mut install_execute_sequence = vec![
+        standard_action("CostInitialize", 800),
+        standard_action("FileCost", 900),
+        standard_action("CostFinalize", 1000),
+        standard_action("InstallValidate", 1400),
+        standard_action("InstallInitialize", 1500),
+        standard_action("ProcessComponents", 1600),
+        standard_action("UnpublishFeatures", 1800),
+        standard_action("RemoveRegistryValues", 2600),
+        standard_action("UnregisterExtensionInfo", 2700),
+        standard_action("UnregisterProgIdInfo", 2710),
+        standard_action("UnregisterMIMEInfo", 2720),
+        standard_action("RemoveShortcuts", 3200),
+        standard_action("RemoveFiles", 3500),
+        standard_action("InstallFiles", 4000),
+        standard_action("RegisterExtensionInfo", 4300),
+        standard_action("RegisterProgIdInfo", 4310),
+        standard_action("RegisterMIMEInfo", 4320),
+        standard_action("CreateShortcuts", 4500),
+        standard_action("WriteRegistryValues", 5000),
+        standard_action("RegisterUser", 6000),
+        standard_action("RegisterProduct", 6100),
+        standard_action("PublishFeatures", 6300),
+        standard_action("PublishProduct", 6400),
+        standard_action("InstallFinalize", 6600),
+    ];
+    if msi.auto_run {
+        install_execute_sequence.push(vec![
+            s(MSI_AUTO_RUN_ACTION_ID),
+            s("NOT REMOVE"),
+            Value::from(MSI_AUTO_RUN_SEQUENCE),
+        ]);
+    }
     insert_msi_table_rows(
         installer,
         "InstallExecuteSequence",
-        vec![
-            standard_action("CostInitialize", 800),
-            standard_action("FileCost", 900),
-            standard_action("CostFinalize", 1000),
-            standard_action("InstallValidate", 1400),
-            standard_action("InstallInitialize", 1500),
-            standard_action("ProcessComponents", 1600),
-            standard_action("UnpublishFeatures", 1800),
-            standard_action("RemoveRegistryValues", 2600),
-            standard_action("UnregisterExtensionInfo", 2700),
-            standard_action("UnregisterProgIdInfo", 2710),
-            standard_action("UnregisterMIMEInfo", 2720),
-            standard_action("RemoveShortcuts", 3200),
-            standard_action("RemoveFiles", 3500),
-            standard_action("InstallFiles", 4000),
-            standard_action("RegisterExtensionInfo", 4300),
-            standard_action("RegisterProgIdInfo", 4310),
-            standard_action("RegisterMIMEInfo", 4320),
-            standard_action("CreateShortcuts", 4500),
-            standard_action("WriteRegistryValues", 5000),
-            standard_action("RegisterUser", 6000),
-            standard_action("RegisterProduct", 6100),
-            standard_action("PublishFeatures", 6300),
-            standard_action("PublishProduct", 6400),
-            standard_action("InstallFinalize", 6600),
-        ],
+        install_execute_sequence,
     )?;
     insert_msi_table_rows(
         installer,
@@ -2412,6 +2461,20 @@ fn insert_msi_shortcut_properties(installer: &mut Package<File>, msi: &MsiMakerP
     }
 
     insert_msi_table_rows(installer, "MsiShortcutProperty", rows)
+}
+
+fn insert_msi_auto_run(installer: &mut Package<File>, msi: &MsiMakerPlan) -> Result<()> {
+    insert_msi_table_rows(
+        installer,
+        "CustomAction",
+        vec![vec![
+            s(MSI_AUTO_RUN_ACTION_ID),
+            Value::from(MSI_AUTO_RUN_CUSTOM_ACTION_TYPE),
+            s("INSTALLFOLDER"),
+            s(format!(r"[SystemFolder]cmd.exe /C start {}", msi.exe)),
+            Value::Null,
+        ]],
+    )
 }
 
 fn insert_msi_file_associations(
@@ -2679,6 +2742,10 @@ fn standard_action(action: &str, sequence: i32) -> Vec<Value> {
 
 fn action_text(action: &str, description: &str, template: &str) -> Vec<Value> {
     vec![s(action), s(description), s(template)]
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn collect_msi_payload(
@@ -3714,6 +3781,7 @@ mod tests {
                             "rebootMode":"Force",
                             "defaultInstallMode":"perUser",
                             "associateExtensions":"desk,.plan;desk",
+                            "autoRun":true,
                             "features":{
                                 "autoLaunch":{
                                     "enabled":true,
@@ -3771,6 +3839,7 @@ mod tests {
         assert_eq!(msi.install_level, 4);
         assert_eq!(msi.reboot_mode, "Force");
         assert_eq!(msi.default_install_mode.as_str(), "perUser");
+        assert!(msi.auto_run);
         assert_eq!(msi.file_associations.len(), 2);
         assert_eq!(msi.file_associations[0].extension, "desk");
         assert_eq!(msi.file_associations[0].prog_id, "starterapp.desk");
@@ -4261,6 +4330,7 @@ mod tests {
         assert!(installer.has_table("Extension"));
         assert!(installer.has_table("MIME"));
         assert!(installer.has_table("Verb"));
+        assert!(installer.has_table("CustomAction"));
         assert!(installer.has_stream("app.cab"));
 
         let properties = msi_rows(&mut installer, "Property");
@@ -4342,6 +4412,7 @@ mod tests {
                             "rebootMode":"Force",
                             "defaultInstallMode":"perUser",
                             "associateExtensions":"desk,.plan;desk",
+                            "autoRun":true,
                             "features":{
                                 "autoLaunch":{
                                     "enabled":true,
@@ -4537,6 +4608,22 @@ mod tests {
             Value::from(0),
             Value::from("Open desk"),
             Value::from("\"%1\"")
+        ]));
+
+        let custom_actions = msi_rows(&mut installer, "CustomAction");
+        assert!(custom_actions.contains(&vec![
+            Value::from("LaunchScriptAfter"),
+            Value::from(34),
+            Value::from("INSTALLFOLDER"),
+            Value::from("[SystemFolder]cmd.exe /C start starter-app.exe"),
+            Value::Null
+        ]));
+
+        let install_execute_sequence = msi_rows(&mut installer, "InstallExecuteSequence");
+        assert!(install_execute_sequence.contains(&vec![
+            Value::from("LaunchScriptAfter"),
+            Value::from("NOT REMOVE"),
+            Value::from(6601)
         ]));
 
         let directories = msi_rows(&mut installer, "Directory");
