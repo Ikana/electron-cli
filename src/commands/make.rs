@@ -97,6 +97,7 @@ struct MsiMakerConfig {
     upgrade_code: Option<String>,
     install_level: Option<i32>,
     reboot_mode: Option<String>,
+    default_install_mode: Option<String>,
     auto_launch: Option<MsiAutoLaunchConfig>,
 }
 
@@ -121,6 +122,7 @@ struct MsiMakerPlan {
     upgrade_code: String,
     install_level: i32,
     reboot_mode: String,
+    default_install_mode: MsiInstallMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_launch: Option<MsiAutoLaunchPlan>,
 }
@@ -135,6 +137,43 @@ struct MsiAutoLaunchConfig {
 struct MsiAutoLaunchPlan {
     arguments: Vec<String>,
     registry_value: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum MsiInstallMode {
+    PerMachine,
+    PerUser,
+}
+
+impl MsiInstallMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PerMachine => "perMachine",
+            Self::PerUser => "perUser",
+        }
+    }
+
+    fn all_users(self) -> &'static str {
+        match self {
+            Self::PerMachine => "1",
+            Self::PerUser => "2",
+        }
+    }
+
+    fn msi_install_per_user(self) -> &'static str {
+        match self {
+            Self::PerMachine => "0",
+            Self::PerUser => "1",
+        }
+    }
+
+    fn summary_word_count(self) -> i32 {
+        match self {
+            Self::PerMachine => 2,
+            Self::PerUser => 10,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -415,6 +454,8 @@ fn msi_maker_plan(
         .as_deref()
         .and_then(normalized_msi_text)
         .unwrap_or_else(|| "ReallySuppress".to_string());
+    let default_install_mode =
+        msi_install_mode(configured.default_install_mode.as_deref(), warnings);
     let auto_launch = configured
         .auto_launch
         .as_ref()
@@ -444,6 +485,7 @@ fn msi_maker_plan(
         upgrade_code,
         install_level,
         reboot_mode,
+        default_install_mode,
         auto_launch,
     }))
 }
@@ -495,6 +537,23 @@ fn msi_auto_launch_registry_value(exe: &str, arguments: &[String]) -> String {
         format!(" {}", arguments.join(" "))
     };
     format!("\"[INSTALLFOLDER]{exe}\"{suffix}")
+}
+
+fn msi_install_mode(value: Option<&str>, warnings: &mut Vec<String>) -> MsiInstallMode {
+    let Some(value) = value.and_then(normalized_msi_text) else {
+        return MsiInstallMode::PerMachine;
+    };
+
+    match value.as_str() {
+        "perMachine" => MsiInstallMode::PerMachine,
+        "perUser" => MsiInstallMode::PerUser,
+        _ => {
+            warnings.push(format!(
+                "maker-wix defaultInstallMode must be \"perMachine\" or \"perUser\" and will be ignored: {value}."
+            ));
+            MsiInstallMode::PerMachine
+        }
+    }
 }
 
 fn default_msi_upgrade_code(package: &PackageReport, name: &str) -> String {
@@ -731,6 +790,7 @@ fn maker_wix_config(object: &serde_json::Map<String, JsonValue>) -> MsiMakerConf
         upgrade_code: maker_config_string(object, config, "upgradeCode"),
         install_level: maker_config_i32(object, config, "installLevel"),
         reboot_mode: maker_config_string(object, config, "rebootMode"),
+        default_install_mode: maker_config_string(object, config, "defaultInstallMode"),
         auto_launch: maker_wix_auto_launch(object, config),
     }
 }
@@ -1003,6 +1063,10 @@ fn print_report(report: &MakeReport, json: bool) -> Result<()> {
         println!("  upgrade code: {}", msi.upgrade_code);
         println!("  install level: {}", msi.install_level);
         println!("  reboot mode: {}", msi.reboot_mode);
+        println!(
+            "  default install mode: {}",
+            msi.default_install_mode.as_str()
+        );
         if let Some(description) = &msi.description {
             println!("  description: {description}");
         }
@@ -1698,7 +1762,7 @@ fn write_msi_summary(
     summary.set_arch(arch.to_string());
     summary.set_languages(&[language]);
     summary.set_page_count(500);
-    summary.set_word_count(2);
+    summary.set_word_count(msi.default_install_mode.summary_word_count());
     Ok(())
 }
 
@@ -1885,7 +1949,11 @@ fn insert_msi_rows(
         vec![s("ProductVersion"), s(product_version)],
         vec![s("Manufacturer"), s(&msi.manufacturer)],
         vec![s("UpgradeCode"), s(&msi.upgrade_code)],
-        vec![s("ALLUSERS"), s("1")],
+        vec![s("ALLUSERS"), s(msi.default_install_mode.all_users())],
+        vec![
+            s("MSIINSTALLPERUSER"),
+            s(msi.default_install_mode.msi_install_per_user()),
+        ],
         vec![s("INSTALLLEVEL"), s(msi.install_level.to_string())],
         vec![s("REBOOT"), s(&msi.reboot_mode)],
     ];
@@ -3225,6 +3293,7 @@ mod tests {
                             "upgradeCode":"11111111-2222-3333-4444-555555555555",
                             "installLevel":4,
                             "rebootMode":"Force",
+                            "defaultInstallMode":"perUser",
                             "features":{
                                 "autoLaunch":{
                                     "enabled":true,
@@ -3281,6 +3350,7 @@ mod tests {
         assert_eq!(msi.upgrade_code, "{11111111-2222-3333-4444-555555555555}");
         assert_eq!(msi.install_level, 4);
         assert_eq!(msi.reboot_mode, "Force");
+        assert_eq!(msi.default_install_mode.as_str(), "perUser");
         let auto_launch = msi
             .auto_launch
             .as_ref()
@@ -3338,6 +3408,7 @@ mod tests {
             json: true,
         };
         let report = build_report(&args).expect("report should build");
+        let msi = report.msi.as_ref().expect("msi plan should be resolved");
         let auto_launch = report
             .msi
             .as_ref()
@@ -3345,6 +3416,7 @@ mod tests {
             .expect("auto launch should be enabled");
 
         assert!(auto_launch.arguments.is_empty());
+        assert_eq!(msi.default_install_mode.as_str(), "perMachine");
         assert_eq!(
             auto_launch.registry_value,
             "\"[INSTALLFOLDER]starter-app.exe\""
@@ -3749,6 +3821,7 @@ mod tests {
         let mut installer = msi::open(report.artifact.as_str()).expect("msi should parse");
         assert_eq!(installer.summary_info().arch(), Some("x64"));
         assert_eq!(installer.summary_info().page_count(), Some(500));
+        assert_eq!(installer.summary_info().word_count(), Some(2));
         assert!(installer.has_table("Property"));
         assert!(installer.has_table("Directory"));
         assert!(installer.has_table("File"));
@@ -3763,6 +3836,8 @@ mod tests {
             Value::from("starter-app")
         ]));
         assert!(properties.contains(&vec![Value::from("ProductVersion"), Value::from("0.1.0")]));
+        assert!(properties.contains(&vec![Value::from("ALLUSERS"), Value::from("1")]));
+        assert!(properties.contains(&vec![Value::from("MSIINSTALLPERUSER"), Value::from("0")]));
 
         let shortcut_properties = msi_rows(&mut installer, "MsiShortcutProperty");
         assert!(shortcut_properties.iter().any(|row| {
@@ -3832,6 +3907,7 @@ mod tests {
                             "upgradeCode":"11111111-2222-3333-4444-555555555555",
                             "installLevel":4,
                             "rebootMode":"Force",
+                            "defaultInstallMode":"perUser",
                             "features":{
                                 "autoLaunch":{
                                     "enabled":true,
@@ -3875,6 +3951,7 @@ mod tests {
 
         let mut installer = msi::open(report.artifact.as_str()).expect("msi should parse");
         assert_eq!(installer.summary_info().author(), Some("Acme Tools"));
+        assert_eq!(installer.summary_info().word_count(), Some(10));
 
         let properties = msi_rows(&mut installer, "Property");
         assert!(properties.contains(&vec![Value::from("ProductName"), Value::from("Desk Suite")]));
@@ -3890,6 +3967,8 @@ mod tests {
         ]));
         assert!(properties.contains(&vec![Value::from("INSTALLLEVEL"), Value::from("4")]));
         assert!(properties.contains(&vec![Value::from("REBOOT"), Value::from("Force")]));
+        assert!(properties.contains(&vec![Value::from("ALLUSERS"), Value::from("2")]));
+        assert!(properties.contains(&vec![Value::from("MSIINSTALLPERUSER"), Value::from("1")]));
         assert!(properties.contains(&vec![
             Value::from("ARPPRODUCTICON"),
             Value::from("AppIcon.ico")
